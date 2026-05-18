@@ -105,6 +105,23 @@ function sanitizeSubscriber(subscriber, includePrivate = false) {
   return includePrivate ? subscriber : { ...subscriber, email: maskEmail(subscriber.email) };
 }
 
+function sanitizeEmailLog(log) {
+  if (!log) return null;
+  const { result, ...safe } = log;
+  return {
+    ...safe,
+    result: result
+      ? {
+          ok: result.ok,
+          dryRun: result.dryRun,
+          provider: result.provider,
+          id: result.id,
+          reason: result.reason
+        }
+      : undefined
+  };
+}
+
 function isAdminRequest(request, url) {
   const token = process.env.ADMIN_TOKEN;
   if (!token) return false;
@@ -600,7 +617,7 @@ const server = createServer(async (request, response) => {
         sendEmailsEnabled,
         publicBaseUrl,
         configuredSchedules: schedules.filter((schedule) => schedule.status === "configured" && !schedule.unsubscribedAt).length,
-        lastEmail: logs.at(-1) || null
+        lastEmail: sanitizeEmailLog(logs.at(-1))
       }));
       return;
     }
