@@ -1,0 +1,16 @@
+[
+  {
+    "id": "qqq-open",
+    "name": "QQQ open",
+    "tickers": ["QQQ", "SPY", "NVDA", "DXY"],
+    "notes": "Rates, AI breadth, Singapore timing.",
+    "updatedAt": "2026-05-18T00:00:00.000Z"
+  },
+  {
+    "id": "nvda-china",
+    "name": "NVDA China",
+    "tickers": ["NVDA", "TSM", "AVGO", "MU", "QQQ"],
+    "notes": "China policy, AI export controls, suppliers.",
+    "updatedAt": "2026-05-18T00:00:00.000Z"
+  }
+]

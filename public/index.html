@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ThesisOS</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <aside class="sidebar" aria-label="Finance workspace">
+        <div class="side-brand">
+          <span class="mark">T</span>
+          <strong>ThesisOS</strong>
+        </div>
+
+        <button class="side-action" id="newAnalysisButton" type="button">New analysis</button>
+        <button class="side-action muted" id="newFolderButton" type="button">New folder</button>
+
+        <section class="side-section" id="foldersList">
+          <h2>Folders</h2>
+          <button class="folder active" type="button" data-folder="QQQ open" data-tickers="QQQ,SPY,NVDA,DXY">
+            <span>QQQ open</span>
+            <small>Rates, AI breadth</small>
+          </button>
+          <button class="folder" type="button" data-folder="NVDA China" data-tickers="NVDA,TSM,AVGO,MU,QQQ">
+            <span>NVDA China</span>
+            <small>TSM, AVGO, export rules</small>
+          </button>
+          <button class="folder" type="button" data-folder="Macro" data-tickers="DXY,SPY,QQQ,USOIL,GOLD">
+            <span>Macro</span>
+            <small>CPI, yields, DXY</small>
+          </button>
+          <button class="folder" type="button" data-folder="Crypto" data-tickers="BTC,ETH,SOL">
+            <span>Crypto</span>
+            <small>BTC, ETH, flows</small>
+          </button>
+        </section>
+
+        <section class="side-section">
+          <h2>Bundles</h2>
+          <button class="folder compact" type="button" data-bundle="AI" data-tickers="NVDA,TSM,AVGO,MU">AI: NVDA, TSM, AVGO, MU</button>
+          <button class="folder compact" type="button" data-bundle="Index" data-tickers="SPY,QQQ,IWM">Index: SPY, QQQ, IWM</button>
+          <button class="folder compact" type="button" data-bundle="FX" data-tickers="EUR,USDJPY,DXY">FX: EUR, USDJPY, DXY</button>
+        </section>
+
+        <section class="plan-card">
+          <span>Pro</span>
+          <strong>$12/mo</strong>
+          <small>More runs, saved folders, delivery rules.</small>
+          <button type="button">Upgrade</button>
+        </section>
+      </aside>
+
+      <section class="chat-area" aria-label="Finance analyst chat">
+        <header class="chat-top">
+          <div>
+            <strong id="activeFolderName">QQQ open</strong>
+            <span>Chat wrapper powered by the financial engine skill.</span>
+          </div>
+          <div class="top-actions">
+            <button class="deep-button active" id="deepThinkToggle" type="button">Deep Think</button>
+            <label class="model-pill">
+              <span>Model</span>
+              <select id="modelSelect" aria-label="Model">
+                <option value="gpt-5.5">GPT-5.5</option>
+                <option value="gpt-5.4">GPT-5.4</option>
+                <option value="gpt-5.4-mini">GPT-5.4 Mini</option>
+              </select>
+            </label>
+          </div>
+        </header>
+
+        <section class="session-strip" aria-label="Market session status">
+          <div><span>SGT</span><strong id="sgtClock">--:--</strong></div>
+          <div><span>US cash</span><strong id="cashState">Checking</strong></div>
+          <div><span>Futures / CFDs</span><strong id="futuresState">Checking</strong></div>
+          <div><span>Crypto</span><strong>24/7</strong></div>
+        </section>
+
+        <section class="alert-strip" aria-label="Alerts">
+          <button type="button" data-prompt="Alert me before the US cash open and summarize QQQ opportunities.">US open alert</button>
+          <button type="button" data-prompt="Watch BTC and ETH liquidity while stocks are closed.">Crypto watch</button>
+          <button class="locked" type="button" data-prompt="Show subscribed opportunities with leverage bands.">Opportunities Pro</button>
+        </section>
+
+        <div class="messages" id="conversation" aria-live="polite">
+          <section class="welcome-panel" id="welcomePanel">
+            <span>Financial engine ready</span>
+            <h1>What should we analyze?</h1>
+            <p>Ask, paste tickers, or open a folder.</p>
+            <div class="suggestions">
+              <button data-prompt="Research TradingView market context for QQQ and give me a Monday open plan.">Research QQQ open</button>
+              <button data-prompt="Create a folder for NVDA, TSM, AVGO, MU, QQQ, DXY, and China catalysts.">Create NVDA folder</button>
+              <button data-prompt="Set up two Singapore-time opportunity emails with leverage bands and source checks.">Set daily emails</button>
+              <button data-prompt="Analyze BTC, ETH, QQQ, DXY, and US cash timing together.">Crypto + stocks</button>
+            </div>
+          </section>
+
+          <article class="message assistant draft" id="enginePreview">
+            <span>Engine preview</span>
+            <p id="briefText">I check timing, macro, tickers, catalysts, risk, then save or deliver.</p>
+          </article>
+        </div>
+
+        <div class="quick-prompts" aria-label="Prompt shortcuts">
+          <button data-prompt="Analyze QQQ now.">QQQ</button>
+          <button data-prompt="Analyze NVDA and suppliers.">NVDA</button>
+          <button data-prompt="Analyze BTC and crypto liquidity.">BTC</button>
+          <button data-prompt="Schedule this twice weekly.">Schedule</button>
+        </div>
+
+        <form class="composer" id="askForm">
+          <button type="button" id="attachButton" aria-label="Attach file or screenshot">+</button>
+          <input
+            id="marketPrompt"
+            autocomplete="off"
+            aria-label="Ask ThesisOS"
+            placeholder="Ask finance, paste tickers, or create a folder..."
+          />
+          <button type="submit">Send</button>
+        </form>
+      </section>
+
+      <aside class="context-drawer" aria-label="Saved context">
+        <header>
+          <strong>Context</strong>
+          <span id="contextSubtitle">QQQ open</span>
+        </header>
+
+        <section class="context-block">
+          <h2>Engine</h2>
+          <p id="engineState">Skill endpoint ready</p>
+          <small id="providerState">Model calls use OPENAI_API_KEY when configured.</small>
+        </section>
+
+        <section class="context-block">
+          <h2>Ticker bundle</h2>
+          <div class="ticker-row" id="tickerRow">
+            <span>QQQ</span>
+            <span>SPY</span>
+            <span>NVDA</span>
+            <span>TSM</span>
+            <span>BTC</span>
+          </div>
+        </section>
+
+        <section class="context-block">
+          <h2>Run plan</h2>
+          <ol>
+            <li>Check Singapore-time market windows.</li>
+            <li>Load folders, bundles, and source modules.</li>
+            <li>Research catalysts, crypto, macro, and social.</li>
+            <li>Write probabilities, leverage bands, TP/SL.</li>
+            <li>Email the brief or hold for review.</li>
+          </ol>
+        </section>
+
+        <section class="context-block">
+          <h2>Connect</h2>
+          <div class="connect-list">
+            <button type="button">OpenAI key</button>
+            <button type="button">TradingView MCP</button>
+            <button type="button">Custom MCP</button>
+          </div>
+        </section>
+
+        <section class="context-block opportunities">
+          <h2>Opportunities</h2>
+          <p>Pro only</p>
+          <small>Shows timed setups like QQQ 6x-8x after confirmation.</small>
+        </section>
+
+        <section class="context-block price-box">
+          <h2>Subscription</h2>
+          <p><strong>$12/month</strong></p>
+          <small>More limits, saved folders, better analysis, scheduled delivery.</small>
+          <button type="button">Upgrade</button>
+        </section>
+
+        <section class="context-block autopilot-card">
+          <div class="block-heading">
+            <h2>Email autopilot</h2>
+            <span>SGT</span>
+          </div>
+          <p>Two concise opportunity briefs per day: Asia reset and US-open prep.</p>
+          <form id="subscribeForm" class="delivery-form">
+            <input required type="email" name="email" placeholder="email@example.com" />
+            <select name="cadence">
+              <option value="twice-daily" selected>Twice daily</option>
+              <option value="daily">Daily</option>
+              <option value="weekdays">Weekdays only</option>
+              <option value="manual">Manual only</option>
+            </select>
+            <div class="time-grid" aria-label="Singapore send times">
+              <label>
+                <span>Asia reset</span>
+                <input name="sendTime" value="08:30" />
+              </label>
+              <label>
+                <span>US open prep</span>
+                <input name="sendTime" value="21:00" />
+              </label>
+            </div>
+            <select name="riskMode">
+              <option value="balanced">Balanced: 3x-8x default</option>
+              <option value="aggressive">Aggressive: 8x-18x only after trigger</option>
+              <option value="defensive">Defensive: spot to 3x</option>
+            </select>
+            <input name="maxLeverage" value="8x normal / 18x high-risk only" />
+            <input name="creatorWatchlist" value="Sajad, CheatG" />
+            <input type="hidden" name="location" value="Singapore" />
+            <input type="hidden" name="focus" value="QQQ, SPY, NVDA, TSM, BTC, ETH, SOL, macro timing" />
+
+            <fieldset class="module-grid">
+              <legend>Source modules</legend>
+              <label><input type="checkbox" name="sourceModule" value="tradingview" checked /> TradingView</label>
+              <label><input type="checkbox" name="sourceModule" value="news" checked /> News</label>
+              <label><input type="checkbox" name="sourceModule" value="coin-market-data" checked /> CMC data</label>
+              <label><input type="checkbox" name="sourceModule" value="fear-greed" checked /> Fear/greed</label>
+              <label><input type="checkbox" name="sourceModule" value="funding-liquidations" checked /> Funding/liqs</label>
+              <label><input type="checkbox" name="sourceModule" value="youtube-social" checked /> YouTube/social</label>
+            </fieldset>
+
+            <fieldset class="module-grid">
+              <legend>Markets</legend>
+              <label><input type="checkbox" name="market" value="crypto" checked /> Crypto</label>
+              <label><input type="checkbox" name="market" value="indices" checked /> SPY/QQQ</label>
+              <label><input type="checkbox" name="market" value="ai-equities" checked /> AI stocks</label>
+              <label><input type="checkbox" name="market" value="macro" checked /> Macro</label>
+            </fieldset>
+
+            <label><input type="checkbox" name="channel" value="email" checked /> Email</label>
+            <label><input type="checkbox" name="channel" value="telegram" /> Telegram</label>
+            <label><input type="checkbox" name="emergencyAlerts" value="true" checked /> Immediate alert when a tracked creator/source confirms a major move</label>
+            <button type="submit">Save email plan</button>
+          </form>
+          <small id="saveStatus">Email schedule storage ready. SMTP/Resend/Gmail sends when connected.</small>
+        </section>
+
+        <section class="context-block note">
+          <h2>Status</h2>
+          <p>TradingView MCP, email sending, and Telegram are shown as integrations until connected.</p>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
