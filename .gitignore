@@ -5,4 +5,5 @@ node_modules/
 npm-debug.log*
 data/subscribers.json
 data/email-schedules.json
+data/sent-emails.json
 public/uploads/

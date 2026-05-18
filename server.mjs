@@ -9,8 +9,12 @@ const publicDir = join(root, "public");
 const dataFile = join(root, "data", "subscribers.json");
 const foldersFile = join(root, "data", "folders.json");
 const emailSchedulesFile = join(root, "data", "email-schedules.json");
+const sentEmailsFile = join(root, "data", "sent-emails.json");
 const skillPath = process.env.FINANCIAL_ENGINE_SKILL_PATH || "/Users/arnav/.codex/skills/market-leverage-sentiment/SKILL.md";
 const port = Number(process.env.PORT || 4177);
+const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || `http://localhost:${port}`).replace(/\/$/, "");
+const schedulerEnabled = process.env.SCHEDULER_ENABLED !== "false";
+const sendEmailsEnabled = process.env.SEND_EMAILS === "true";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -40,6 +44,22 @@ async function readEmailSchedules() {
   return JSON.parse(raw || "[]");
 }
 
+async function writeEmailSchedules(schedules) {
+  await writeFile(emailSchedulesFile, `${JSON.stringify(schedules, null, 2)}\n`);
+}
+
+async function readSentEmails() {
+  if (!existsSync(sentEmailsFile)) return [];
+  const raw = await readFile(sentEmailsFile, "utf8");
+  return JSON.parse(raw || "[]");
+}
+
+async function logEmailSend(record) {
+  const logs = await readSentEmails();
+  logs.push({ ...record, loggedAt: new Date().toISOString() });
+  await writeFile(sentEmailsFile, `${JSON.stringify(logs.slice(-500), null, 2)}\n`);
+}
+
 async function readFinancialEnginePrompt() {
   try {
     const skill = await readFile(skillPath, "utf8");
@@ -59,6 +79,65 @@ async function readFinancialEnginePrompt() {
 function extractTickers(text) {
   const matches = String(text || "").match(/\b[A-Z]{2,6}(?:\/[A-Z]{2,5})?\b/g) || [];
   return [...new Set(matches)].slice(0, 12);
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
+function maskEmail(email) {
+  const [name = "", domain = ""] = String(email || "").split("@");
+  if (!domain) return "hidden";
+  return `${name.slice(0, 2)}***@${domain}`;
+}
+
+function sanitizeSchedule(schedule, includePrivate = false) {
+  if (includePrivate) return schedule;
+  const { email, unsubscribeToken, enginePrompt, ...safe } = schedule;
+  return {
+    ...safe,
+    email: maskEmail(email),
+    enginePromptPreview: enginePrompt ? `${enginePrompt.slice(0, 180)}...` : undefined
+  };
+}
+
+function sanitizeSubscriber(subscriber, includePrivate = false) {
+  return includePrivate ? subscriber : { ...subscriber, email: maskEmail(subscriber.email) };
+}
+
+function isAdminRequest(request, url) {
+  const token = process.env.ADMIN_TOKEN;
+  if (!token) return false;
+  return request.headers["x-admin-token"] === token || url.searchParams.get("admin_token") === token;
+}
+
+function requireAdmin(request, url) {
+  if (!process.env.ADMIN_TOKEN) {
+    const error = new Error("Set ADMIN_TOKEN on the server before using admin endpoints.");
+    error.status = 403;
+    throw error;
+  }
+  if (!isAdminRequest(request, url)) {
+    const error = new Error("Admin token required.");
+    error.status = 401;
+    throw error;
+  }
+}
+
+function getSgtStamp(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-SG", {
+    timeZone: "Asia/Singapore",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const isoDate = `${map.year}-${map.month}-${map.day}`;
+  const hhmm = `${map.hour}:${map.minute}`;
+  return { isoDate, hhmm, label: `${isoDate} ${hhmm} SGT` };
 }
 
 function classifyTicker(ticker) {
@@ -144,6 +223,111 @@ async function runChat(payload) {
     tickers: extractTickers(payload.message).map((ticker) => ({ ticker, type: classifyTicker(ticker) })),
     text: data.output_text || "No text returned."
   };
+}
+
+async function generateDigest(schedule, trigger = "scheduled") {
+  const stamp = getSgtStamp();
+  const message = [
+    schedule.enginePrompt,
+    `Trigger: ${trigger}. Current Singapore time: ${stamp.label}.`,
+    "If live market/news/TradingView connectors are unavailable in this server process, say that clearly and produce a setup-ready brief rather than inventing current prices.",
+    "Return an email-ready brief with: top setup if any, safer leverage band, higher-risk version, three probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and a short warning that this is analysis only."
+  ].join("\n\n");
+
+  const result = await runChat({
+    message,
+    model: process.env.DIGEST_MODEL || "gpt-5.5",
+    deepThink: true,
+    folder: { name: "Email autopilot", tickers: schedule.markets },
+    bundle: schedule.markets.join(", "),
+    location: "Singapore",
+    timezone: "Asia/Singapore"
+  });
+
+  const body = result.text;
+  const sourceLine = result.provider === "openai" ? `Generated by ${result.model}.` : "Generated by local fallback until OPENAI_API_KEY is configured.";
+  const subject = `MarketOS ${trigger} brief - ${stamp.hhmm} SGT`;
+
+  return {
+    subject,
+    text: `${body}\n\n${sourceLine}\nAnalysis only. No orders are placed.`,
+    html: [
+      "<main style=\"font-family:Arial,sans-serif;line-height:1.55;color:#111;max-width:720px\">",
+      `<p style="color:#666">${escapeHtml(stamp.label)} | ${escapeHtml(sourceLine)}</p>`,
+      `<pre style="white-space:pre-wrap;font-family:Arial,sans-serif">${escapeHtml(body)}</pre>`,
+      "<hr />",
+      "<p style=\"color:#666;font-size:13px\">Analysis only. MarketOS does not place orders or guarantee outcomes.</p>",
+      "</main>"
+    ].join("")
+  };
+}
+
+async function sendEmail({ to, subject, html, text, unsubscribeUrl, idempotencyKey }) {
+  const from = process.env.EMAIL_FROM || "MarketOS <onboarding@resend.dev>";
+  const canSend = sendEmailsEnabled && process.env.RESEND_API_KEY && process.env.EMAIL_FROM;
+  const payload = {
+    from,
+    to: [to],
+    subject,
+    html,
+    text,
+    headers: {
+      "List-Unsubscribe": `<${unsubscribeUrl}>`,
+      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"
+    },
+    tags: [{ name: "app", value: "marketos" }]
+  };
+
+  if (!canSend) {
+    const result = {
+      ok: true,
+      dryRun: true,
+      reason: "Set SEND_EMAILS=true, RESEND_API_KEY, and EMAIL_FROM to send real email.",
+      payload: { ...payload, to: payload.to.map(maskEmail) }
+    };
+    await logEmailSend({ provider: "dry-run", to: maskEmail(to), subject, result });
+    return result;
+  }
+
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey.slice(0, 256)
+    },
+    body: JSON.stringify(payload)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data.error?.message || data.message || "Resend email send failed.");
+    error.status = 502;
+    throw error;
+  }
+
+  await logEmailSend({ provider: "resend", to: maskEmail(to), subject, id: data.id });
+  return { ok: true, provider: "resend", id: data.id };
+}
+
+async function sendDigestForSchedule(schedule, trigger = "scheduled") {
+  if (schedule.unsubscribedAt || !schedule.deliveryChannels?.includes("email")) {
+    return { skipped: true, reason: "Schedule is unsubscribed or email is disabled." };
+  }
+
+  const digest = await generateDigest(schedule, trigger);
+  const unsubscribeUrl = `${publicBaseUrl}/unsubscribe?token=${encodeURIComponent(schedule.unsubscribeToken)}`;
+  const idempotencyKey = `${schedule.id}:${trigger}:${getSgtStamp().isoDate}:${getSgtStamp().hhmm}`;
+  const footer = `\n\nUnsubscribe: ${unsubscribeUrl}`;
+  const htmlWithFooter = `${digest.html}<p style="font-size:12px;color:#777"><a href="${escapeHtml(unsubscribeUrl)}">Unsubscribe</a></p>`;
+  const result = await sendEmail({
+    to: schedule.email,
+    subject: digest.subject,
+    html: htmlWithFooter,
+    text: `${digest.text}${footer}`,
+    unsubscribeUrl,
+    idempotencyKey
+  });
+  return { ...result, subject: digest.subject };
 }
 
 async function readFolders() {
@@ -240,10 +424,12 @@ async function saveEmailSchedule(payload) {
   const sendTimesSgt = normalizeList(payload.sendTimesSgt, ["08:30", "21:00"])
     .filter((time) => /^\d{2}:\d{2}$/.test(time))
     .slice(0, 4);
+  const existing = schedules.find((item) => item.email === normalizedEmail);
 
   const record = {
-    id: payload.id || crypto.randomUUID(),
+    id: payload.id || existing?.id || crypto.randomUUID(),
     email: normalizedEmail,
+    unsubscribeToken: existing?.unsubscribeToken || crypto.randomUUID(),
     timezone: "Asia/Singapore",
     cadence: String(payload.cadence || "twice-daily"),
     sendTimesSgt: sendTimesSgt.length ? sendTimesSgt : ["08:30", "21:00"],
@@ -262,6 +448,10 @@ async function saveEmailSchedule(payload) {
     includeEmergencyAlerts: Boolean(payload.includeEmergencyAlerts),
     deliveryChannels: normalizeList(payload.deliveryChannels, ["email"]).slice(0, 4),
     status: "configured",
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    lastSentKey: existing?.lastSentKey,
+    lastSentAt: existing?.lastSentAt,
+    unsubscribedAt: null,
     updatedAt: new Date().toISOString()
   };
 
@@ -274,8 +464,75 @@ async function saveEmailSchedule(payload) {
     schedules.push(record);
   }
 
-  await writeFile(emailSchedulesFile, `${JSON.stringify(schedules, null, 2)}\n`);
-  return { ok: true, schedule: record, count: schedules.length };
+  await writeEmailSchedules(schedules);
+  return { ok: true, schedule: sanitizeSchedule(record), count: schedules.length };
+}
+
+async function unsubscribeSchedule(token) {
+  const schedules = await readEmailSchedules();
+  const index = schedules.findIndex((schedule) => schedule.unsubscribeToken === token);
+  if (index < 0) {
+    const error = new Error("Unsubscribe link is invalid or expired.");
+    error.status = 404;
+    throw error;
+  }
+
+  schedules[index] = {
+    ...schedules[index],
+    status: "unsubscribed",
+    unsubscribedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  await writeEmailSchedules(schedules);
+  return schedules[index];
+}
+
+let schedulerRunning = false;
+
+async function runSchedulerTick() {
+  if (schedulerRunning) return;
+  schedulerRunning = true;
+  try {
+    const stamp = getSgtStamp();
+    const schedules = await readEmailSchedules();
+    let changed = false;
+
+    for (const schedule of schedules) {
+      if (schedule.status !== "configured" || schedule.unsubscribedAt) continue;
+      if (!schedule.sendTimesSgt?.includes(stamp.hhmm)) continue;
+
+      const sendKey = `${schedule.id}:${stamp.isoDate}:${stamp.hhmm}`;
+      if (schedule.lastSentKey === sendKey) continue;
+
+      try {
+        const result = await sendDigestForSchedule(schedule, stamp.hhmm);
+        schedule.lastSentKey = sendKey;
+        schedule.lastSentAt = new Date().toISOString();
+        schedule.lastSendResult = result.dryRun ? "dry-run" : result.provider || "sent";
+        changed = true;
+        console.log(`[scheduler] ${stamp.label} ${schedule.email}: ${schedule.lastSendResult}`);
+      } catch (error) {
+        schedule.lastSendError = error.message;
+        changed = true;
+        console.error(`[scheduler] ${stamp.label} ${schedule.email}: ${error.message}`);
+      }
+    }
+
+    if (changed) await writeEmailSchedules(schedules);
+  } finally {
+    schedulerRunning = false;
+  }
+}
+
+function startScheduler() {
+  if (!schedulerEnabled) {
+    console.log("[scheduler] disabled by SCHEDULER_ENABLED=false");
+    return;
+  }
+
+  console.log(`[scheduler] enabled; SEND_EMAILS=${sendEmailsEnabled ? "true" : "false"}; PUBLIC_BASE_URL=${publicBaseUrl}`);
+  setTimeout(() => runSchedulerTick().catch((error) => console.error(`[scheduler] ${error.message}`)), 5_000);
+  setInterval(() => runSchedulerTick().catch((error) => console.error(`[scheduler] ${error.message}`)), 60_000);
 }
 
 async function serveStatic(pathname, response, headOnly = false) {
@@ -312,8 +569,9 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/api/subscribers") {
       const subscribers = await readSubscribers();
+      const includePrivate = isAdminRequest(request, url);
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(JSON.stringify({ count: subscribers.length, subscribers }));
+      response.end(JSON.stringify({ count: subscribers.length, subscribers: subscribers.map((item) => sanitizeSubscriber(item, includePrivate)) }));
       return;
     }
 
@@ -327,8 +585,52 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/api/email-schedules") {
       const schedules = await readEmailSchedules();
+      const includePrivate = isAdminRequest(request, url);
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(JSON.stringify({ count: schedules.length, schedules }));
+      response.end(JSON.stringify({ count: schedules.length, schedules: schedules.map((item) => sanitizeSchedule(item, includePrivate)) }));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/scheduler/status") {
+      const schedules = await readEmailSchedules();
+      const logs = await readSentEmails();
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({
+        schedulerEnabled,
+        sendEmailsEnabled,
+        publicBaseUrl,
+        configuredSchedules: schedules.filter((schedule) => schedule.status === "configured" && !schedule.unsubscribedAt).length,
+        lastEmail: logs.at(-1) || null
+      }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/run-digest") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const schedules = await readEmailSchedules();
+      const schedule = schedules.find((item) => item.id === payload.scheduleId || item.email === String(payload.email || "").toLowerCase());
+      if (!schedule) {
+        response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ error: "Schedule not found." }));
+        return;
+      }
+      const result = await sendDigestForSchedule(schedule, String(payload.trigger || "manual"));
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, result }));
+      return;
+    }
+
+    if ((request.method === "GET" || request.method === "POST") && url.pathname === "/unsubscribe") {
+      const token = url.searchParams.get("token");
+      if (!token) {
+        response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        response.end("Missing unsubscribe token.");
+        return;
+      }
+      const schedule = await unsubscribeSchedule(token);
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end(`<main style="font-family:Arial,sans-serif;max-width:640px;margin:48px auto;line-height:1.5"><h1>Unsubscribed</h1><p>${escapeHtml(maskEmail(schedule.email))} will no longer receive MarketOS email briefs.</p></main>`);
       return;
     }
 
@@ -384,4 +686,5 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, () => {
   console.log(`ThesisOS running at http://localhost:${port}`);
+  startScheduler();
 });
