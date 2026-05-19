@@ -17,6 +17,18 @@ const codexBriefsFile = join(root, "data", "codex-briefs.json");
 const memoryDir = join(root, "data", "market-memory");
 const memoryIndexFile = join(root, "data", "market-memory-index.json");
 const skillPath = process.env.FINANCIAL_ENGINE_SKILL_PATH || "/Users/arnav/.codex/skills/market-leverage-sentiment/SKILL.md";
+const builtInFinancialEnginePrompt = [
+  "You are MarketOS, an analysis-only finance intelligence engine for a Singapore-based user.",
+  "You produce source-aware market thesis briefs for crypto, indices, AI equities, FX, macro, and geopolitical catalysts.",
+  "Never place orders, enable trading, guarantee outcomes, or tell the user to go all-in.",
+  "For leveraged setups, express risk as conditional bands, liquidation/wick tolerance, stop/invalidation logic, and scenario probabilities.",
+  "Always separate public/news facts, technical data, source limitations, and inference.",
+  "For Telegram, prefer terse message packs: NOW, THESIS, SETUPS, WATCH.",
+  "SETUPS must be conditional: asset | bias | trigger | invalidation | safer leverage band | high-risk band.",
+  "If current market data or TradingView/MCP is unavailable in this server process, say so clearly and do not invent prices.",
+  "Use the chain: development -> mechanism -> affected asset -> expected repricing/flow -> leverage implication.",
+  "For scheduled briefs, include exactly three scenarios whose probabilities sum to 100%."
+].join("\n");
 const port = Number(process.env.PORT || 4177);
 const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || `http://localhost:${port}`).replace(/\/$/, "");
 const schedulerEnabled = process.env.SCHEDULER_ENABLED !== "false";
@@ -121,9 +133,8 @@ async function readFinancialEnginePrompt() {
     };
   } catch {
     return {
-      loaded: false,
-      prompt:
-        "You are ThesisOS, a finance analysis agent. Always check market timing, macro regime, catalyst chain, technicals, risk, leverage room, TP/SL, and source quality. Analysis only, no order placement."
+      loaded: "built-in",
+      prompt: builtInFinancialEnginePrompt
     };
   }
 }
@@ -433,6 +444,41 @@ function fallbackAnalysis(payload, skillLoaded) {
   };
 }
 
+function collectResponseText(value, output = []) {
+  if (!value) return output;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) output.push(trimmed);
+    return output;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectResponseText(item, output);
+    return output;
+  }
+
+  if (typeof value !== "object") return output;
+
+  if (value.type === "output_text" || value.type === "text") {
+    collectResponseText(value.text, output);
+  }
+  if (typeof value.output_text === "string") collectResponseText(value.output_text, output);
+  if (typeof value.text === "string") collectResponseText(value.text, output);
+  if (typeof value.content === "string") collectResponseText(value.content, output);
+  if (value.content && value.content !== value) collectResponseText(value.content, output);
+  if (value.message && value.message !== value) collectResponseText(value.message, output);
+  if (value.output && value.output !== value) collectResponseText(value.output, output);
+  if (value.choices && value.choices !== value) collectResponseText(value.choices, output);
+
+  return output;
+}
+
+function extractOpenAIResponseText(data) {
+  const candidates = collectResponseText(data?.output_text || data?.output || data?.choices || data?.content || data?.message);
+  return [...new Set(candidates)].join("\n\n").trim();
+}
+
 async function runChat(payload) {
   const engine = await readFinancialEnginePrompt();
   const model = String(payload.model || "gpt-5.5");
@@ -490,7 +536,7 @@ async function runChat(payload) {
     model,
     skillLoaded: engine.loaded,
     tickers: extractTickers(payload.message).map((ticker) => ({ ticker, type: classifyTicker(ticker) })),
-    text: data.output_text || "No text returned."
+    text: extractOpenAIResponseText(data) || `OpenAI returned no text. Response id: ${data.id || "unknown"}.`
   };
 }
 
