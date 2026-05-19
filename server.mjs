@@ -22,6 +22,7 @@ const sendEmailsEnabled = process.env.SEND_EMAILS === "true";
 const sendTelegramsEnabled = process.env.SEND_TELEGRAMS === "true";
 const researchPollEnabled = process.env.RESEARCH_POLL_ENABLED === "true";
 const researchPollIntervalMs = Math.max(15, Number(process.env.RESEARCH_POLL_INTERVAL_MINUTES || 180)) * 60_000;
+const telegramMessageSeparator = "---MSG---";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -153,6 +154,7 @@ function sanitizeCodexBrief(brief, includeText = false) {
       ok: result.ok,
       provider: result.provider,
       dryRun: result.dryRun,
+      messageCount: result.messageCount,
       messageIds: result.messageIds,
       id: result.id,
       reason: result.reason
@@ -289,10 +291,11 @@ async function generateDigest(schedule, trigger = "scheduled") {
     `Trigger: ${trigger}. Current Singapore time: ${stamp.label}.`,
     `Delivery channel priority: Telegram first, email second. Alert style: ${schedule.alertStyle || "compact"}.`,
     isFlash
-      ? "This is a FLASH alert. Return at most 3 one-line alerts. Format each line: ASSET | direction/bias | trigger | invalidation. No essay."
-      : "This is a scheduled thesis. Use four short sections: WHAT HAPPENED, WHAT MATTERS, SETUPS, WATCH. Keep each bullet under 18 words.",
+      ? `Return a Telegram message pack separated by exactly ${telegramMessageSeparator}. Message 1: FLASH - at most 3 one-line alerts under 160 chars each. Message 2: WATCH - at most 3 bullets. No essay.`
+      : `Return exactly 4 Telegram messages separated by exactly ${telegramMessageSeparator}. Message 1 title: NOW - one directional read and max 3 one-line alerts. Message 2 title: THESIS - what happened and why it matters, max 5 bullets. Message 3 title: SETUPS - max 3 conditional setups, each as ASSET | bias | trigger | invalidation | leverage band. Message 4 title: WATCH - next events/source status, max 5 bullets.`,
     "If live market/news/TradingView connectors are unavailable in this server process, say that clearly and produce a setup-ready brief rather than inventing current prices.",
-    "Return a Telegram-ready brief with: top setup if any, safer leverage band, higher-risk version, three probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and a short warning that this is analysis only.",
+    "Keep each Telegram message under 900 characters. No intro, no conclusion, no repeated headers. If there is no confirmed trade trigger, say 'No clean trigger' rather than forcing one.",
+    "Include: top setup if any, safer leverage band, higher-risk version, three probability scenarios summing to 100%, TP/SL/invalidation logic, and source modules checked.",
     `Optional social/news source context:\n${JSON.stringify(sourceContext).slice(0, 12000)}`
   ].join("\n\n");
 
@@ -377,7 +380,8 @@ function chunkTelegramText(text) {
   let remaining = String(text || "");
 
   while (remaining.length > limit) {
-    const splitAt = Math.max(remaining.lastIndexOf("\n", limit), remaining.lastIndexOf(" ", limit), limit);
+    const softSplitAt = Math.max(remaining.lastIndexOf("\n", limit), remaining.lastIndexOf(" ", limit));
+    const splitAt = softSplitAt > 0 ? softSplitAt : limit;
     chunks.push(remaining.slice(0, splitAt).trim());
     remaining = remaining.slice(splitAt).trim();
   }
@@ -386,12 +390,43 @@ function chunkTelegramText(text) {
   return chunks;
 }
 
+function splitTelegramSections(text) {
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return [];
+
+  if (cleaned.includes(telegramMessageSeparator)) {
+    return cleaned
+      .split(telegramMessageSeparator)
+      .map((part) => part.trim())
+      .filter(Boolean);
+  }
+
+  const sectionPattern = /(?=^(?:NOW|FLASH|THESIS|SETUPS|WATCH|WATCH NEXT|WHAT HAPPENED|WHAT MATTERS|WHY IT MATTERS|TECHNICALS|CHAIN|ONE-LINER ALERTS)\b[:\s-]*)/gim;
+  const sections = cleaned
+    .split(sectionPattern)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  return sections.length > 1 ? sections : [cleaned];
+}
+
+function buildTelegramMessages(subject, text) {
+  const sections = splitTelegramSections(text);
+  const messages = sections.length ? sections : [String(text || "").trim()];
+  return messages.flatMap((section, index) => {
+    const body = index === 0 ? `${subject}\n\n${section}` : section;
+    return chunkTelegramText(body).filter(Boolean);
+  });
+}
+
 async function sendTelegram({ chatId, subject, text, idempotencyKey }) {
   const targetChatId = String(chatId || process.env.TELEGRAM_DEFAULT_CHAT_ID || "").trim();
+  const messages = buildTelegramMessages(subject, text);
   const canSend = sendTelegramsEnabled && process.env.TELEGRAM_BOT_TOKEN && targetChatId;
   const payloadPreview = {
     chat_id: targetChatId ? "configured" : "missing",
-    text: `${subject}\n\n${String(text || "").slice(0, 500)}`
+    messageCount: messages.length,
+    text: messages[0]?.slice(0, 500)
   };
 
   if (!canSend) {
@@ -406,10 +441,9 @@ async function sendTelegram({ chatId, subject, text, idempotencyKey }) {
     return result;
   }
 
-  const chunks = chunkTelegramText(`${subject}\n\n${text}`);
   const sent = [];
 
-  for (const [index, chunk] of chunks.entries()) {
+  for (const [index, chunk] of messages.entries()) {
     const response = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: {
@@ -432,7 +466,7 @@ async function sendTelegram({ chatId, subject, text, idempotencyKey }) {
   }
 
   await logEmailSend({ provider: "telegram", to: "telegram-chat", subject, ids: sent });
-  return { ok: true, provider: "telegram", messageIds: sent };
+  return { ok: true, provider: "telegram", messageIds: sent, messageCount: sent.length };
 }
 
 async function sendDigestForSchedule(schedule, trigger = "scheduled") {
@@ -623,8 +657,8 @@ function buildDigestPrompt(record) {
     `Markets: ${markets}.`,
     `Sources: TradingView/OHLCV when available, macro calendar, CoinMarketCap-style market data, fear/greed/liquidity, funding/liquidations, source-tiered news, YouTube transcript/metadata extraction, X flow, Perplexity/web synthesis, and creator/social watchlist: ${creators}.`,
     "Research engine: discover new public source events, extract captions/transcripts when available, store creator/source memory, and mark TradingView/MCP status honestly.",
-    "Alert lanes: FLASH is one line under 220 characters; WHAT HAPPENED is daily recap; WHAT MATTERS is macro/geopolitics; SETUPS are conditional trade ideas only after triggers.",
-    `Output style: Telegram first, terse, no text walls. Use ${record.alertStyle || "compact"} mode. Include only the strongest setup lines.`,
+    `Alert lanes: FLASH is one line under 220 characters; NOW is scan-first summary; THESIS is context; SETUPS are conditional trade ideas only after triggers; WATCH is next events.`,
+    `Output style: Telegram first, terse, no text walls. Separate Telegram cards with ${telegramMessageSeparator}. Use ${record.alertStyle || "compact"} mode. Include only the strongest setup lines.`,
     `Output: top opportunities, probability scenarios summing to 100%, leverage bands, safer vs high-risk version, TP/SL logic, invalidation, and source ledger.`,
     `Safety: analysis only; do not place orders or guarantee outcomes.`
   ].join(" ");
