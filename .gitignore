@@ -6,4 +6,8 @@ npm-debug.log*
 data/subscribers.json
 data/email-schedules.json
 data/sent-emails.json
+data/creators.json
+data/source-events.json
+data/research-runs.json
+data/alert-queue.json
 public/uploads/

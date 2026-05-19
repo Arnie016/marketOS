@@ -4,9 +4,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getResearchStatus, runResearchSnapshot } from "./research-engine.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
+const dataDir = join(root, "data");
 const dataFile = join(root, "data", "subscribers.json");
 const foldersFile = join(root, "data", "folders.json");
 const emailSchedulesFile = join(root, "data", "email-schedules.json");
@@ -17,6 +19,8 @@ const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || `http://localhost:${
 const schedulerEnabled = process.env.SCHEDULER_ENABLED !== "false";
 const sendEmailsEnabled = process.env.SEND_EMAILS === "true";
 const sendTelegramsEnabled = process.env.SEND_TELEGRAMS === "true";
+const researchPollEnabled = process.env.RESEARCH_POLL_ENABLED === "true";
+const researchPollIntervalMs = Math.max(15, Number(process.env.RESEARCH_POLL_INTERVAL_MINUTES || 180)) * 60_000;
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -247,7 +251,7 @@ async function runChat(payload) {
 
 async function generateDigest(schedule, trigger = "scheduled") {
   const stamp = getSgtStamp();
-  const sourceContext = await collectSourceContext(schedule);
+  const sourceContext = await runResearchSnapshot(schedule, { trigger, dataDir });
   const isFlash = /flash|alert|emergency/i.test(trigger);
   const message = [
     schedule.enginePrompt,
@@ -508,170 +512,6 @@ function normalizeList(value, fallback = []) {
   return items.length ? items : fallback;
 }
 
-function getIsoHoursAgo(hours) {
-  return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
-}
-
-function summarizeYouTubeItem(item) {
-  return {
-    title: item.snippet?.title,
-    channelTitle: item.snippet?.channelTitle,
-    publishedAt: item.snippet?.publishedAt,
-    videoId: item.id?.videoId,
-    url: item.id?.videoId ? `https://www.youtube.com/watch?v=${item.id.videoId}` : undefined,
-    description: item.snippet?.description
-  };
-}
-
-async function fetchYouTubeContext(schedule) {
-  if (!process.env.YOUTUBE_API_KEY) {
-    return {
-      status: "not_configured",
-      note: "Set YOUTUBE_API_KEY to search fresh creator/video metadata. Official YouTube transcripts for third-party videos are not available through API-key-only access."
-    };
-  }
-
-  const defaultQueries = [
-    "crypto market analysis ETH BTC liquidity",
-    "stock market today QQQ SPY Nvidia",
-    "macro market analysis Fed yields dollar",
-    ...schedule.creatorWatchlist.map((creator) => `${creator} market analysis`)
-  ];
-  const queries = normalizeList(schedule.youtubeQueries, defaultQueries).slice(0, 5);
-  const publishedAfter = getIsoHoursAgo(Number(process.env.YOUTUBE_LOOKBACK_HOURS || 36));
-  const results = [];
-
-  for (const query of queries) {
-    const params = new URLSearchParams({
-      part: "snippet",
-      type: "video",
-      order: "date",
-      maxResults: "4",
-      publishedAfter,
-      q: query,
-      key: process.env.YOUTUBE_API_KEY
-    });
-    const response = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      return { status: "error", provider: "youtube", error: data.error?.message || response.statusText };
-    }
-    results.push({
-      query,
-      items: (data.items || []).map(summarizeYouTubeItem)
-    });
-  }
-
-  return {
-    status: "ok",
-    provider: "youtube-data-api",
-    caveat: "Metadata/search only. Transcript extraction needs owned-channel OAuth or a separate transcript provider.",
-    queries,
-    results
-  };
-}
-
-function summarizeXPost(post, usersById) {
-  const user = usersById.get(post.author_id);
-  return {
-    text: post.text,
-    createdAt: post.created_at,
-    author: user?.username || post.author_id,
-    metrics: post.public_metrics,
-    url: user?.username && post.id ? `https://x.com/${user.username}/status/${post.id}` : undefined
-  };
-}
-
-async function fetchXContext(schedule) {
-  if (!process.env.X_BEARER_TOKEN) {
-    return { status: "not_configured", note: "Set X_BEARER_TOKEN to search recent X posts." };
-  }
-
-  const defaultQueries = [
-    "($ETH OR $BTC OR $SOL) (liquidity OR liquidation OR funding OR breakout) lang:en -is:retweet",
-    "($QQQ OR $SPY OR $NVDA) (market OR earnings OR breakout OR macro) lang:en -is:retweet",
-    "(Fed OR yields OR DXY OR China) (markets OR risk) lang:en -is:retweet"
-  ];
-  const queries = normalizeList(schedule.xQueries, defaultQueries).slice(0, 4);
-  const results = [];
-
-  for (const query of queries) {
-    const params = new URLSearchParams({
-      query,
-      max_results: "10",
-      "tweet.fields": "created_at,public_metrics,author_id",
-      expansions: "author_id",
-      "user.fields": "username,name,verified"
-    });
-    const response = await fetch(`https://api.x.com/2/tweets/search/recent?${params}`, {
-      headers: { Authorization: `Bearer ${process.env.X_BEARER_TOKEN}` }
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      return { status: "error", provider: "x-api", error: data.detail || data.title || response.statusText };
-    }
-    const usersById = new Map((data.includes?.users || []).map((user) => [user.id, user]));
-    results.push({
-      query,
-      posts: (data.data || []).map((post) => summarizeXPost(post, usersById))
-    });
-  }
-
-  return { status: "ok", provider: "x-api", queries, results };
-}
-
-async function fetchPerplexityContext(schedule) {
-  if (!process.env.PERPLEXITY_API_KEY) {
-    return { status: "not_configured", note: "Set PERPLEXITY_API_KEY to add current web/news synthesis." };
-  }
-
-  const prompt = [
-    "Give a terse market-intelligence scan for a Telegram trading analyst bot.",
-    `Markets: ${schedule.markets.join(", ")}.`,
-    `Creator/social watchlist: ${schedule.creatorWatchlist.join(", ")}.`,
-    "Separate: major news, geopolitics/macro, crypto liquidity, equity/index setup implications.",
-    "No trade guarantees. Keep under 180 words."
-  ].join(" ");
-
-  const response = await fetch("https://api.perplexity.ai/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: process.env.PERPLEXITY_MODEL || "sonar-pro",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-      max_tokens: 450
-    })
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    return { status: "error", provider: "perplexity", error: data.error?.message || response.statusText };
-  }
-
-  return {
-    status: "ok",
-    provider: "perplexity",
-    text: data.choices?.[0]?.message?.content || ""
-  };
-}
-
-async function collectSourceContext(schedule) {
-  const modules = await Promise.allSettled([
-    fetchYouTubeContext(schedule),
-    fetchXContext(schedule),
-    fetchPerplexityContext(schedule)
-  ]);
-
-  const [youtube, x, perplexity] = modules.map((result) =>
-    result.status === "fulfilled" ? result.value : { status: "error", error: result.reason?.message || "source failed" }
-  );
-
-  return { youtube, x, perplexity };
-}
-
 function buildDigestPrompt(record) {
   const times = record.sendTimesSgt.join(" and ");
   const markets = record.markets.join(", ");
@@ -680,7 +520,8 @@ function buildDigestPrompt(record) {
   return [
     `Run the market-leverage-sentiment engine for a Singapore-based user at ${times} SGT.`,
     `Markets: ${markets}.`,
-    `Sources: TradingView/OHLCV when available, macro calendar, CoinMarketCap-style market data, fear/greed/liquidity, funding/liquidations, source-tiered news, and creator/social watchlist: ${creators}.`,
+    `Sources: TradingView/OHLCV when available, macro calendar, CoinMarketCap-style market data, fear/greed/liquidity, funding/liquidations, source-tiered news, YouTube transcript/metadata extraction, X flow, Perplexity/web synthesis, and creator/social watchlist: ${creators}.`,
+    "Research engine: discover new public source events, extract captions/transcripts when available, store creator/source memory, and mark TradingView/MCP status honestly.",
     "Alert lanes: FLASH is one line under 220 characters; WHAT HAPPENED is daily recap; WHAT MATTERS is macro/geopolitics; SETUPS are conditional trade ideas only after triggers.",
     `Output style: Telegram first, terse, no text walls. Use ${record.alertStyle || "compact"} mode. Include only the strongest setup lines.`,
     `Output: top opportunities, probability scenarios summing to 100%, leverage bands, safer vs high-risk version, TP/SL logic, invalidation, and source ledger.`,
@@ -712,6 +553,7 @@ async function saveEmailSchedule(payload) {
     sendTimesSgt: sendTimesSgt.length ? sendTimesSgt : ["08:30", "21:00"],
     markets: normalizeList(payload.markets, ["crypto", "indices", "ai-equities", "macro"]).slice(0, 12),
     creatorWatchlist: normalizeList(payload.creatorWatchlist, ["Sajad", "Keith Gill", "Coin Bureau", "Benjamin Cowen", "DataDash"]).slice(0, 20),
+    trustedCreatorChannelIds: normalizeList(payload.trustedCreatorChannelIds, []).slice(0, 50),
     youtubeQueries: normalizeList(payload.youtubeQueries, [
       "crypto market analysis ETH BTC liquidity",
       "stock market today QQQ SPY Nvidia",
@@ -732,6 +574,9 @@ async function saveEmailSchedule(payload) {
     riskMode: String(payload.riskMode || "balanced").trim(),
     maxLeverage: String(payload.maxLeverage || "8x normal / 18x high-risk only").trim(),
     alertStyle: String(payload.alertStyle || "compact").trim(),
+    marketSymbols: normalizeList(payload.marketSymbols, ["BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:SOLUSDT", "NASDAQ:QQQ", "NASDAQ:NVDA", "TVC:DXY"]).slice(0, 20),
+    transcriptsEnabled: payload.transcriptsEnabled !== false,
+    discoveryEnabled: payload.discoveryEnabled !== false,
     includeEmergencyAlerts: Boolean(payload.includeEmergencyAlerts),
     deliveryChannels: normalizeList(payload.deliveryChannels, ["email"]).slice(0, 4),
     telegramChatId: String(payload.telegramChatId || existing?.telegramChatId || process.env.TELEGRAM_DEFAULT_CHAT_ID || "").trim(),
@@ -776,6 +621,7 @@ async function unsubscribeSchedule(token) {
 }
 
 let schedulerRunning = false;
+let researchMonitorRunning = false;
 
 async function runSchedulerTick() {
   if (schedulerRunning) return;
@@ -827,6 +673,52 @@ function startScheduler() {
   );
   setTimeout(() => runSchedulerTick().catch((error) => console.error(`[scheduler] ${error.message}`)), 5_000);
   setInterval(() => runSchedulerTick().catch((error) => console.error(`[scheduler] ${error.message}`)), 60_000);
+}
+
+function formatFlashAlerts(alerts) {
+  return alerts
+    .slice(0, 5)
+    .map((alert) => `${alert.severity.toUpperCase()} | ${alert.text}${alert.url ? ` | ${alert.url}` : ""}`)
+    .join("\n");
+}
+
+async function runResearchMonitorTick() {
+  if (researchMonitorRunning) return;
+  researchMonitorRunning = true;
+  try {
+    const schedules = await readEmailSchedules();
+    for (const schedule of schedules) {
+      if (schedule.status !== "configured" || schedule.unsubscribedAt || !schedule.includeEmergencyAlerts) continue;
+      const result = await runResearchSnapshot(schedule, { trigger: "monitor-flash", dataDir });
+      const alerts = result.memory?.alerts || [];
+      if (!alerts.length) continue;
+
+      if (schedule.deliveryChannels?.includes("telegram")) {
+        await sendTelegram({
+          chatId: schedule.telegramChatId,
+          subject: "MarketOS FLASH",
+          text: `${formatFlashAlerts(alerts)}\n\nAnalysis only. No orders are placed.`,
+          idempotencyKey: `${schedule.id}:monitor:${alerts.map((alert) => alert.sourceId).join(":")}`
+        });
+      }
+      console.log(`[research] ${schedule.email}: ${alerts.length} flash alert(s)`);
+    }
+  } catch (error) {
+    console.error(`[research] ${error.message}`);
+  } finally {
+    researchMonitorRunning = false;
+  }
+}
+
+function startResearchMonitor() {
+  if (!researchPollEnabled) {
+    console.log("[research] monitor disabled by RESEARCH_POLL_ENABLED!=true");
+    return;
+  }
+
+  console.log(`[research] monitor enabled; interval=${Math.round(researchPollIntervalMs / 60_000)}m`);
+  setTimeout(() => runResearchMonitorTick().catch((error) => console.error(`[research] ${error.message}`)), 15_000);
+  setInterval(() => runResearchMonitorTick().catch((error) => console.error(`[research] ${error.message}`)), researchPollIntervalMs);
 }
 
 async function serveStatic(pathname, response, headOnly = false) {
@@ -888,16 +780,57 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/scheduler/status") {
       const schedules = await readEmailSchedules();
       const logs = await readSentEmails();
+      const research = await getResearchStatus(dataDir).catch(() => null);
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({
         schedulerEnabled,
         sendEmailsEnabled,
         sendTelegramsEnabled,
+        researchPollEnabled,
+        researchPollIntervalMinutes: Math.round(researchPollIntervalMs / 60_000),
         telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_DEFAULT_CHAT_ID),
+        youtubeConfigured: Boolean(process.env.YOUTUBE_API_KEY),
+        xConfigured: Boolean(process.env.X_BEARER_TOKEN),
+        perplexityConfigured: Boolean(process.env.PERPLEXITY_API_KEY),
+        tradingViewHttpConfigured: Boolean(process.env.TRADINGVIEW_MCP_HTTP_URL || process.env.MARKET_DATA_HTTP_URL),
         publicBaseUrl,
         configuredSchedules: schedules.filter((schedule) => schedule.status === "configured" && !schedule.unsubscribedAt).length,
+        research: research
+          ? {
+              lastRun: research.lastRun,
+              creatorCount: research.creatorCount,
+              eventCount: research.eventCount,
+              pendingAlertCount: research.pendingAlerts.length
+            }
+          : null,
         lastEmail: sanitizeEmailLog(logs.at(-1))
       }));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/research/status") {
+      requireAdmin(request, url);
+      const result = await getResearchStatus(dataDir);
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify(result));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/research/run") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const schedules = await readEmailSchedules();
+      const schedule =
+        schedules.find((item) => item.id === payload.scheduleId || item.email === String(payload.email || "").toLowerCase()) ||
+        schedules.find((item) => item.status === "configured" && !item.unsubscribedAt);
+      if (!schedule) {
+        response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ error: "Schedule not found." }));
+        return;
+      }
+      const result = await runResearchSnapshot(schedule, { trigger: String(payload.trigger || "manual-research"), dataDir });
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, result }));
       return;
     }
 
@@ -997,4 +930,5 @@ const server = createServer(async (request, response) => {
 server.listen(port, () => {
   console.log(`ThesisOS running at http://localhost:${port}`);
   startScheduler();
+  startResearchMonitor();
 });
