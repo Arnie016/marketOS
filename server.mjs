@@ -15,6 +15,7 @@ const port = Number(process.env.PORT || 4177);
 const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || `http://localhost:${port}`).replace(/\/$/, "");
 const schedulerEnabled = process.env.SCHEDULER_ENABLED !== "false";
 const sendEmailsEnabled = process.env.SEND_EMAILS === "true";
+const sendTelegramsEnabled = process.env.SEND_TELEGRAMS === "true";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -93,10 +94,11 @@ function maskEmail(email) {
 
 function sanitizeSchedule(schedule, includePrivate = false) {
   if (includePrivate) return schedule;
-  const { email, unsubscribeToken, enginePrompt, ...safe } = schedule;
+  const { email, unsubscribeToken, enginePrompt, telegramChatId, ...safe } = schedule;
   return {
     ...safe,
     email: maskEmail(email),
+    telegramChatId: telegramChatId ? "configured" : undefined,
     enginePromptPreview: enginePrompt ? `${enginePrompt.slice(0, 180)}...` : undefined
   };
 }
@@ -326,9 +328,73 @@ async function sendEmail({ to, subject, html, text, unsubscribeUrl, idempotencyK
   return { ok: true, provider: "resend", id: data.id };
 }
 
+function chunkTelegramText(text) {
+  const chunks = [];
+  const limit = 3900;
+  let remaining = String(text || "");
+
+  while (remaining.length > limit) {
+    const splitAt = Math.max(remaining.lastIndexOf("\n", limit), remaining.lastIndexOf(" ", limit), limit);
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+async function sendTelegram({ chatId, subject, text, idempotencyKey }) {
+  const targetChatId = String(chatId || process.env.TELEGRAM_DEFAULT_CHAT_ID || "").trim();
+  const canSend = sendTelegramsEnabled && process.env.TELEGRAM_BOT_TOKEN && targetChatId;
+  const payloadPreview = {
+    chat_id: targetChatId ? "configured" : "missing",
+    text: `${subject}\n\n${String(text || "").slice(0, 500)}`
+  };
+
+  if (!canSend) {
+    const result = {
+      ok: true,
+      dryRun: true,
+      provider: "telegram",
+      reason: "Set SEND_TELEGRAMS=true, TELEGRAM_BOT_TOKEN, and TELEGRAM_DEFAULT_CHAT_ID or a schedule telegramChatId to send Telegram.",
+      payload: payloadPreview
+    };
+    await logEmailSend({ provider: "telegram-dry-run", to: targetChatId ? "telegram-chat" : "missing-chat", subject, result });
+    return result;
+  }
+
+  const chunks = chunkTelegramText(`${subject}\n\n${text}`);
+  const sent = [];
+
+  for (const [index, chunk] of chunks.entries()) {
+    const response = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-MarketOS-Idempotency-Key": `${idempotencyKey}:${index}`.slice(0, 256)
+      },
+      body: JSON.stringify({
+        chat_id: targetChatId,
+        text: chunk,
+        disable_web_page_preview: true
+      })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      const error = new Error(data.description || "Telegram send failed.");
+      error.status = 502;
+      throw error;
+    }
+    sent.push(data.result?.message_id);
+  }
+
+  await logEmailSend({ provider: "telegram", to: "telegram-chat", subject, ids: sent });
+  return { ok: true, provider: "telegram", messageIds: sent };
+}
+
 async function sendDigestForSchedule(schedule, trigger = "scheduled") {
-  if (schedule.unsubscribedAt || !schedule.deliveryChannels?.includes("email")) {
-    return { skipped: true, reason: "Schedule is unsubscribed or email is disabled." };
+  if (schedule.unsubscribedAt) {
+    return { skipped: true, reason: "Schedule is unsubscribed." };
   }
 
   const digest = await generateDigest(schedule, trigger);
@@ -336,15 +402,35 @@ async function sendDigestForSchedule(schedule, trigger = "scheduled") {
   const idempotencyKey = `${schedule.id}:${trigger}:${getSgtStamp().isoDate}:${getSgtStamp().hhmm}`;
   const footer = `\n\nUnsubscribe: ${unsubscribeUrl}`;
   const htmlWithFooter = `${digest.html}<p style="font-size:12px;color:#777"><a href="${escapeHtml(unsubscribeUrl)}">Unsubscribe</a></p>`;
-  const result = await sendEmail({
-    to: schedule.email,
-    subject: digest.subject,
-    html: htmlWithFooter,
-    text: `${digest.text}${footer}`,
-    unsubscribeUrl,
-    idempotencyKey
-  });
-  return { ...result, subject: digest.subject };
+  const deliveryResults = [];
+
+  if (schedule.deliveryChannels?.includes("email")) {
+    const result = await sendEmail({
+      to: schedule.email,
+      subject: digest.subject,
+      html: htmlWithFooter,
+      text: `${digest.text}${footer}`,
+      unsubscribeUrl,
+      idempotencyKey
+    });
+    deliveryResults.push(result);
+  }
+
+  if (schedule.deliveryChannels?.includes("telegram")) {
+    const result = await sendTelegram({
+      chatId: schedule.telegramChatId,
+      subject: digest.subject,
+      text: digest.text,
+      idempotencyKey
+    });
+    deliveryResults.push(result);
+  }
+
+  if (!deliveryResults.length) {
+    return { skipped: true, reason: "No delivery channels are enabled." };
+  }
+
+  return { ok: true, subject: digest.subject, deliveries: deliveryResults };
 }
 
 async function readFolders() {
@@ -464,6 +550,7 @@ async function saveEmailSchedule(payload) {
     maxLeverage: String(payload.maxLeverage || "8x normal / 18x high-risk only").trim(),
     includeEmergencyAlerts: Boolean(payload.includeEmergencyAlerts),
     deliveryChannels: normalizeList(payload.deliveryChannels, ["email"]).slice(0, 4),
+    telegramChatId: String(payload.telegramChatId || existing?.telegramChatId || process.env.TELEGRAM_DEFAULT_CHAT_ID || "").trim(),
     status: "configured",
     createdAt: existing?.createdAt || new Date().toISOString(),
     lastSentKey: existing?.lastSentKey,
@@ -525,7 +612,11 @@ async function runSchedulerTick() {
         const result = await sendDigestForSchedule(schedule, stamp.hhmm);
         schedule.lastSentKey = sendKey;
         schedule.lastSentAt = new Date().toISOString();
-        schedule.lastSendResult = result.dryRun ? "dry-run" : result.provider || "sent";
+        schedule.lastSendResult = result.deliveries
+          ? result.deliveries.map((delivery) => `${delivery.provider || "delivery"}${delivery.dryRun ? "-dry-run" : ""}`).join(",")
+          : result.dryRun
+            ? "dry-run"
+            : result.provider || "sent";
         changed = true;
         console.log(`[scheduler] ${stamp.label} ${schedule.email}: ${schedule.lastSendResult}`);
       } catch (error) {
@@ -547,7 +638,9 @@ function startScheduler() {
     return;
   }
 
-  console.log(`[scheduler] enabled; SEND_EMAILS=${sendEmailsEnabled ? "true" : "false"}; PUBLIC_BASE_URL=${publicBaseUrl}`);
+  console.log(
+    `[scheduler] enabled; SEND_EMAILS=${sendEmailsEnabled ? "true" : "false"}; SEND_TELEGRAMS=${sendTelegramsEnabled ? "true" : "false"}; PUBLIC_BASE_URL=${publicBaseUrl}`
+  );
   setTimeout(() => runSchedulerTick().catch((error) => console.error(`[scheduler] ${error.message}`)), 5_000);
   setInterval(() => runSchedulerTick().catch((error) => console.error(`[scheduler] ${error.message}`)), 60_000);
 }
@@ -615,6 +708,8 @@ const server = createServer(async (request, response) => {
       response.end(JSON.stringify({
         schedulerEnabled,
         sendEmailsEnabled,
+        sendTelegramsEnabled,
+        telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_DEFAULT_CHAT_ID),
         publicBaseUrl,
         configuredSchedules: schedules.filter((schedule) => schedule.status === "configured" && !schedule.unsubscribedAt).length,
         lastEmail: sanitizeEmailLog(logs.at(-1))
@@ -633,6 +728,20 @@ const server = createServer(async (request, response) => {
         return;
       }
       const result = await sendDigestForSchedule(schedule, String(payload.trigger || "manual"));
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, result }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/telegram/test") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const result = await sendTelegram({
+        chatId: payload.telegramChatId,
+        subject: "MarketOS Telegram test",
+        text: "Telegram delivery is connected. Scheduled opportunity briefs can now use this channel.",
+        idempotencyKey: `telegram-test:${Date.now()}`
+      });
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({ ok: true, result }));
       return;

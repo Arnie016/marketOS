@@ -261,6 +261,7 @@ subscribeForm.addEventListener("submit", async (event) => {
     cadence: formData.get("cadence"),
     riskMode: formData.get("riskMode"),
     maxLeverage: formData.get("maxLeverage"),
+    telegramChatId: formData.get("telegramChatId"),
     focus: formData.get("focus"),
     creatorWatchlist: formData.get("creatorWatchlist"),
     sendTimesSgt,
@@ -282,7 +283,7 @@ subscribeForm.addEventListener("submit", async (event) => {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Save failed");
     window.localStorage.setItem("thesis-os:last-email-schedule", JSON.stringify(result.schedule));
-    saveStatus.textContent = `Saved ${result.count} email plan${result.count === 1 ? "" : "s"}`;
+    saveStatus.textContent = `Saved ${result.count} delivery plan${result.count === 1 ? "" : "s"}`;
     appendMessage("assistant", "Email autopilot", renderScheduleConfirmation(result.schedule), "draft");
   } catch (error) {
     saveStatus.textContent = error.message;
