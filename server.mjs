@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ const dataFile = join(root, "data", "subscribers.json");
 const foldersFile = join(root, "data", "folders.json");
 const emailSchedulesFile = join(root, "data", "email-schedules.json");
 const sentEmailsFile = join(root, "data", "sent-emails.json");
+const codexBriefsFile = join(root, "data", "codex-briefs.json");
 const skillPath = process.env.FINANCIAL_ENGINE_SKILL_PATH || "/Users/arnav/.codex/skills/market-leverage-sentiment/SKILL.md";
 const port = Number(process.env.PORT || 4177);
 const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || `http://localhost:${port}`).replace(/\/$/, "");
@@ -58,6 +59,17 @@ async function readSentEmails() {
   if (!existsSync(sentEmailsFile)) return [];
   const raw = await readFile(sentEmailsFile, "utf8");
   return JSON.parse(raw || "[]");
+}
+
+async function readCodexBriefs() {
+  if (!existsSync(codexBriefsFile)) return [];
+  const raw = await readFile(codexBriefsFile, "utf8");
+  return JSON.parse(raw || "[]");
+}
+
+async function writeCodexBriefs(briefs) {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(codexBriefsFile, `${JSON.stringify(briefs.slice(0, 300), null, 2)}\n`);
 }
 
 async function logEmailSend(record) {
@@ -126,6 +138,25 @@ function sanitizeEmailLog(log) {
           reason: result.reason
         }
       : undefined
+  };
+}
+
+function sanitizeCodexBrief(brief, includeText = false) {
+  if (!brief) return null;
+  const { text, html, deliveryResults, ...safe } = brief;
+  return {
+    ...safe,
+    textPreview: text ? `${text.slice(0, 500)}${text.length > 500 ? "..." : ""}` : undefined,
+    text: includeText ? text : undefined,
+    html: includeText ? html : undefined,
+    deliveryResults: deliveryResults?.map((result) => ({
+      ok: result.ok,
+      provider: result.provider,
+      dryRun: result.dryRun,
+      messageIds: result.messageIds,
+      id: result.id,
+      reason: result.reason
+    }))
   };
 }
 
@@ -443,6 +474,76 @@ async function sendDigestForSchedule(schedule, trigger = "scheduled") {
   }
 
   return { ok: true, subject: digest.subject, deliveries: deliveryResults };
+}
+
+function findSchedule(schedules, payload = {}) {
+  return (
+    schedules.find((item) => item.id === payload.scheduleId) ||
+    schedules.find((item) => item.email === String(payload.email || "").toLowerCase()) ||
+    schedules.find((item) => item.status === "configured" && !item.unsubscribedAt)
+  );
+}
+
+async function saveAndDeliverCodexBrief(payload) {
+  const schedules = await readEmailSchedules();
+  const schedule = findSchedule(schedules, payload);
+  const stamp = getSgtStamp();
+  const subject = String(payload.subject || `MarketOS Codex brief - ${stamp.hhmm} SGT`).trim().slice(0, 180);
+  const text = String(payload.text || payload.markdown || "").trim();
+  const html = payload.html ? String(payload.html) : `<pre style="white-space:pre-wrap;font-family:Arial,sans-serif">${escapeHtml(text)}</pre>`;
+
+  if (!text) {
+    const error = new Error("Codex brief text is required.");
+    error.status = 400;
+    throw error;
+  }
+
+  const channels = normalizeList(payload.deliveryChannels || payload.channels, schedule?.deliveryChannels || ["telegram"]);
+  const id = payload.id || randomUUID();
+  const deliveryResults = [];
+
+  if (channels.includes("telegram")) {
+    deliveryResults.push(
+      await sendTelegram({
+        chatId: payload.telegramChatId || schedule?.telegramChatId,
+        subject,
+        text,
+        idempotencyKey: `${id}:telegram`
+      })
+    );
+  }
+
+  if (channels.includes("email") && schedule?.email) {
+    const unsubscribeUrl = `${publicBaseUrl}/unsubscribe?token=${encodeURIComponent(schedule.unsubscribeToken)}`;
+    deliveryResults.push(
+      await sendEmail({
+        to: schedule.email,
+        subject,
+        html: `${html}<p style="font-size:12px;color:#777"><a href="${escapeHtml(unsubscribeUrl)}">Unsubscribe</a></p>`,
+        text: `${text}\n\nUnsubscribe: ${unsubscribeUrl}`,
+        unsubscribeUrl,
+        idempotencyKey: `${id}:email`
+      })
+    );
+  }
+
+  const record = {
+    id,
+    subject,
+    text,
+    html,
+    source: String(payload.source || "codex-automation"),
+    trigger: String(payload.trigger || "manual-codex"),
+    scheduleId: schedule?.id,
+    email: schedule?.email ? maskEmail(schedule.email) : undefined,
+    deliveryChannels: channels,
+    deliveryResults,
+    createdAt: new Date().toISOString()
+  };
+  const briefs = await readCodexBriefs();
+  briefs.unshift(record);
+  await writeCodexBriefs(briefs);
+  return record;
 }
 
 async function readFolders() {
@@ -813,6 +914,63 @@ const server = createServer(async (request, response) => {
       const result = await getResearchStatus(dataDir);
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify(result));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/codex/context") {
+      requireAdmin(request, url);
+      const [schedules, research, briefs] = await Promise.all([
+        readEmailSchedules(),
+        getResearchStatus(dataDir),
+        readCodexBriefs()
+      ]);
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({
+        now: getSgtStamp().label,
+        server: {
+          publicBaseUrl,
+          telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_DEFAULT_CHAT_ID),
+          youtubeConfigured: Boolean(process.env.YOUTUBE_API_KEY),
+          xConfigured: Boolean(process.env.X_BEARER_TOKEN),
+          perplexityConfigured: Boolean(process.env.PERPLEXITY_API_KEY),
+          tradingViewHttpConfigured: Boolean(process.env.TRADINGVIEW_MCP_HTTP_URL || process.env.MARKET_DATA_HTTP_URL)
+        },
+        schedules: schedules.map((schedule) => sanitizeSchedule(schedule)),
+        research,
+        recentCodexBriefs: briefs.slice(0, 12).map((brief) => sanitizeCodexBrief(brief))
+      }));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/codex-briefs") {
+      requireAdmin(request, url);
+      const briefs = await readCodexBriefs();
+      const includeText = url.searchParams.get("include_text") === "true";
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ count: briefs.length, briefs: briefs.map((brief) => sanitizeCodexBrief(brief, includeText)) }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/codex-briefs") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const brief = await saveAndDeliverCodexBrief(payload);
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, brief: sanitizeCodexBrief(brief, true) }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/telegram/send") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const result = await sendTelegram({
+        chatId: payload.telegramChatId,
+        subject: String(payload.subject || "MarketOS").slice(0, 180),
+        text: String(payload.text || ""),
+        idempotencyKey: `telegram-direct:${Date.now()}`
+      });
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, result }));
       return;
     }
 
