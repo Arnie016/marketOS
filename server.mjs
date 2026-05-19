@@ -247,11 +247,18 @@ async function runChat(payload) {
 
 async function generateDigest(schedule, trigger = "scheduled") {
   const stamp = getSgtStamp();
+  const sourceContext = await collectSourceContext(schedule);
+  const isFlash = /flash|alert|emergency/i.test(trigger);
   const message = [
     schedule.enginePrompt,
     `Trigger: ${trigger}. Current Singapore time: ${stamp.label}.`,
+    `Delivery channel priority: Telegram first, email second. Alert style: ${schedule.alertStyle || "compact"}.`,
+    isFlash
+      ? "This is a FLASH alert. Return at most 3 one-line alerts. Format each line: ASSET | direction/bias | trigger | invalidation. No essay."
+      : "This is a scheduled thesis. Use four short sections: WHAT HAPPENED, WHAT MATTERS, SETUPS, WATCH. Keep each bullet under 18 words.",
     "If live market/news/TradingView connectors are unavailable in this server process, say that clearly and produce a setup-ready brief rather than inventing current prices.",
-    "Return an email-ready brief with: top setup if any, safer leverage band, higher-risk version, three probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and a short warning that this is analysis only."
+    "Return a Telegram-ready brief with: top setup if any, safer leverage band, higher-risk version, three probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and a short warning that this is analysis only.",
+    `Optional social/news source context:\n${JSON.stringify(sourceContext).slice(0, 12000)}`
   ].join("\n\n");
 
   const result = await runChat({
@@ -501,6 +508,170 @@ function normalizeList(value, fallback = []) {
   return items.length ? items : fallback;
 }
 
+function getIsoHoursAgo(hours) {
+  return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+}
+
+function summarizeYouTubeItem(item) {
+  return {
+    title: item.snippet?.title,
+    channelTitle: item.snippet?.channelTitle,
+    publishedAt: item.snippet?.publishedAt,
+    videoId: item.id?.videoId,
+    url: item.id?.videoId ? `https://www.youtube.com/watch?v=${item.id.videoId}` : undefined,
+    description: item.snippet?.description
+  };
+}
+
+async function fetchYouTubeContext(schedule) {
+  if (!process.env.YOUTUBE_API_KEY) {
+    return {
+      status: "not_configured",
+      note: "Set YOUTUBE_API_KEY to search fresh creator/video metadata. Official YouTube transcripts for third-party videos are not available through API-key-only access."
+    };
+  }
+
+  const defaultQueries = [
+    "crypto market analysis ETH BTC liquidity",
+    "stock market today QQQ SPY Nvidia",
+    "macro market analysis Fed yields dollar",
+    ...schedule.creatorWatchlist.map((creator) => `${creator} market analysis`)
+  ];
+  const queries = normalizeList(schedule.youtubeQueries, defaultQueries).slice(0, 5);
+  const publishedAfter = getIsoHoursAgo(Number(process.env.YOUTUBE_LOOKBACK_HOURS || 36));
+  const results = [];
+
+  for (const query of queries) {
+    const params = new URLSearchParams({
+      part: "snippet",
+      type: "video",
+      order: "date",
+      maxResults: "4",
+      publishedAfter,
+      q: query,
+      key: process.env.YOUTUBE_API_KEY
+    });
+    const response = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return { status: "error", provider: "youtube", error: data.error?.message || response.statusText };
+    }
+    results.push({
+      query,
+      items: (data.items || []).map(summarizeYouTubeItem)
+    });
+  }
+
+  return {
+    status: "ok",
+    provider: "youtube-data-api",
+    caveat: "Metadata/search only. Transcript extraction needs owned-channel OAuth or a separate transcript provider.",
+    queries,
+    results
+  };
+}
+
+function summarizeXPost(post, usersById) {
+  const user = usersById.get(post.author_id);
+  return {
+    text: post.text,
+    createdAt: post.created_at,
+    author: user?.username || post.author_id,
+    metrics: post.public_metrics,
+    url: user?.username && post.id ? `https://x.com/${user.username}/status/${post.id}` : undefined
+  };
+}
+
+async function fetchXContext(schedule) {
+  if (!process.env.X_BEARER_TOKEN) {
+    return { status: "not_configured", note: "Set X_BEARER_TOKEN to search recent X posts." };
+  }
+
+  const defaultQueries = [
+    "($ETH OR $BTC OR $SOL) (liquidity OR liquidation OR funding OR breakout) lang:en -is:retweet",
+    "($QQQ OR $SPY OR $NVDA) (market OR earnings OR breakout OR macro) lang:en -is:retweet",
+    "(Fed OR yields OR DXY OR China) (markets OR risk) lang:en -is:retweet"
+  ];
+  const queries = normalizeList(schedule.xQueries, defaultQueries).slice(0, 4);
+  const results = [];
+
+  for (const query of queries) {
+    const params = new URLSearchParams({
+      query,
+      max_results: "10",
+      "tweet.fields": "created_at,public_metrics,author_id",
+      expansions: "author_id",
+      "user.fields": "username,name,verified"
+    });
+    const response = await fetch(`https://api.x.com/2/tweets/search/recent?${params}`, {
+      headers: { Authorization: `Bearer ${process.env.X_BEARER_TOKEN}` }
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return { status: "error", provider: "x-api", error: data.detail || data.title || response.statusText };
+    }
+    const usersById = new Map((data.includes?.users || []).map((user) => [user.id, user]));
+    results.push({
+      query,
+      posts: (data.data || []).map((post) => summarizeXPost(post, usersById))
+    });
+  }
+
+  return { status: "ok", provider: "x-api", queries, results };
+}
+
+async function fetchPerplexityContext(schedule) {
+  if (!process.env.PERPLEXITY_API_KEY) {
+    return { status: "not_configured", note: "Set PERPLEXITY_API_KEY to add current web/news synthesis." };
+  }
+
+  const prompt = [
+    "Give a terse market-intelligence scan for a Telegram trading analyst bot.",
+    `Markets: ${schedule.markets.join(", ")}.`,
+    `Creator/social watchlist: ${schedule.creatorWatchlist.join(", ")}.`,
+    "Separate: major news, geopolitics/macro, crypto liquidity, equity/index setup implications.",
+    "No trade guarantees. Keep under 180 words."
+  ].join(" ");
+
+  const response = await fetch("https://api.perplexity.ai/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: process.env.PERPLEXITY_MODEL || "sonar-pro",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      max_tokens: 450
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return { status: "error", provider: "perplexity", error: data.error?.message || response.statusText };
+  }
+
+  return {
+    status: "ok",
+    provider: "perplexity",
+    text: data.choices?.[0]?.message?.content || ""
+  };
+}
+
+async function collectSourceContext(schedule) {
+  const modules = await Promise.allSettled([
+    fetchYouTubeContext(schedule),
+    fetchXContext(schedule),
+    fetchPerplexityContext(schedule)
+  ]);
+
+  const [youtube, x, perplexity] = modules.map((result) =>
+    result.status === "fulfilled" ? result.value : { status: "error", error: result.reason?.message || "source failed" }
+  );
+
+  return { youtube, x, perplexity };
+}
+
 function buildDigestPrompt(record) {
   const times = record.sendTimesSgt.join(" and ");
   const markets = record.markets.join(", ");
@@ -510,6 +681,8 @@ function buildDigestPrompt(record) {
     `Run the market-leverage-sentiment engine for a Singapore-based user at ${times} SGT.`,
     `Markets: ${markets}.`,
     `Sources: TradingView/OHLCV when available, macro calendar, CoinMarketCap-style market data, fear/greed/liquidity, funding/liquidations, source-tiered news, and creator/social watchlist: ${creators}.`,
+    "Alert lanes: FLASH is one line under 220 characters; WHAT HAPPENED is daily recap; WHAT MATTERS is macro/geopolitics; SETUPS are conditional trade ideas only after triggers.",
+    `Output style: Telegram first, terse, no text walls. Use ${record.alertStyle || "compact"} mode. Include only the strongest setup lines.`,
     `Output: top opportunities, probability scenarios summing to 100%, leverage bands, safer vs high-risk version, TP/SL logic, invalidation, and source ledger.`,
     `Safety: analysis only; do not place orders or guarantee outcomes.`
   ].join(" ");
@@ -538,7 +711,16 @@ async function saveEmailSchedule(payload) {
     cadence: String(payload.cadence || "twice-daily"),
     sendTimesSgt: sendTimesSgt.length ? sendTimesSgt : ["08:30", "21:00"],
     markets: normalizeList(payload.markets, ["crypto", "indices", "ai-equities", "macro"]).slice(0, 12),
-    creatorWatchlist: normalizeList(payload.creatorWatchlist, ["Sajad", "CheatG"]).slice(0, 20),
+    creatorWatchlist: normalizeList(payload.creatorWatchlist, ["Sajad", "Keith Gill", "Coin Bureau", "Benjamin Cowen", "DataDash"]).slice(0, 20),
+    youtubeQueries: normalizeList(payload.youtubeQueries, [
+      "crypto market analysis ETH BTC liquidity",
+      "stock market today QQQ SPY Nvidia",
+      "macro market analysis Fed yields dollar"
+    ]).slice(0, 10),
+    xQueries: normalizeList(payload.xQueries, [
+      "($ETH OR $BTC OR $SOL) (liquidity OR liquidation OR funding OR breakout) lang:en -is:retweet",
+      "($QQQ OR $SPY OR $NVDA) (market OR earnings OR breakout OR macro) lang:en -is:retweet"
+    ]).slice(0, 10),
     sourceModules: normalizeList(payload.sourceModules, [
       "tradingview",
       "news",
@@ -549,6 +731,7 @@ async function saveEmailSchedule(payload) {
     ]).slice(0, 20),
     riskMode: String(payload.riskMode || "balanced").trim(),
     maxLeverage: String(payload.maxLeverage || "8x normal / 18x high-risk only").trim(),
+    alertStyle: String(payload.alertStyle || "compact").trim(),
     includeEmergencyAlerts: Boolean(payload.includeEmergencyAlerts),
     deliveryChannels: normalizeList(payload.deliveryChannels, ["email"]).slice(0, 4),
     telegramChatId: String(payload.telegramChatId || existing?.telegramChatId || process.env.TELEGRAM_DEFAULT_CHAT_ID || "").trim(),
