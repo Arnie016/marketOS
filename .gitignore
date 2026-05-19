@@ -7,6 +7,8 @@ data/subscribers.json
 data/email-schedules.json
 data/sent-emails.json
 data/codex-briefs.json
+data/market-memory/
+data/market-memory-index.json
 data/creators.json
 data/source-events.json
 data/research-runs.json

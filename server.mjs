@@ -14,6 +14,8 @@ const foldersFile = join(root, "data", "folders.json");
 const emailSchedulesFile = join(root, "data", "email-schedules.json");
 const sentEmailsFile = join(root, "data", "sent-emails.json");
 const codexBriefsFile = join(root, "data", "codex-briefs.json");
+const memoryDir = join(root, "data", "market-memory");
+const memoryIndexFile = join(root, "data", "market-memory-index.json");
 const skillPath = process.env.FINANCIAL_ENGINE_SKILL_PATH || "/Users/arnav/.codex/skills/market-leverage-sentiment/SKILL.md";
 const port = Number(process.env.PORT || 4177);
 const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || `http://localhost:${port}`).replace(/\/$/, "");
@@ -23,6 +25,26 @@ const sendTelegramsEnabled = process.env.SEND_TELEGRAMS === "true";
 const researchPollEnabled = process.env.RESEARCH_POLL_ENABLED === "true";
 const researchPollIntervalMs = Math.max(15, Number(process.env.RESEARCH_POLL_INTERVAL_MINUTES || 180)) * 60_000;
 const telegramMessageSeparator = "---MSG---";
+const ignoredTickerWords = new Set([
+  "AI",
+  "API",
+  "CFD",
+  "FLASH",
+  "MSG",
+  "NOW",
+  "ROI",
+  "SETUPS",
+  "SGT",
+  "SL",
+  "TECHNICALS",
+  "THESIS",
+  "TP",
+  "USD",
+  "US",
+  "VWAP",
+  "WATCH",
+  "WHY"
+]);
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -73,6 +95,17 @@ async function writeCodexBriefs(briefs) {
   await writeFile(codexBriefsFile, `${JSON.stringify(briefs.slice(0, 300), null, 2)}\n`);
 }
 
+async function readMemoryIndex() {
+  if (!existsSync(memoryIndexFile)) return [];
+  const raw = await readFile(memoryIndexFile, "utf8");
+  return JSON.parse(raw || "[]");
+}
+
+async function writeMemoryIndex(entries) {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(memoryIndexFile, `${JSON.stringify(entries.slice(0, 1000), null, 2)}\n`);
+}
+
 async function logEmailSend(record) {
   const logs = await readSentEmails();
   logs.push({ ...record, loggedAt: new Date().toISOString() });
@@ -97,7 +130,7 @@ async function readFinancialEnginePrompt() {
 
 function extractTickers(text) {
   const matches = String(text || "").match(/\b[A-Z]{2,6}(?:\/[A-Z]{2,5})?\b/g) || [];
-  return [...new Set(matches)].slice(0, 12);
+  return [...new Set(matches.filter((ticker) => !ignoredTickerWords.has(ticker.replace(/\W/g, ""))))].slice(0, 12);
 }
 
 function escapeHtml(text) {
@@ -160,6 +193,185 @@ function sanitizeCodexBrief(brief, includeText = false) {
       reason: result.reason
     }))
   };
+}
+
+function slugifyFilePart(value) {
+  return String(value || "note")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "note";
+}
+
+function yamlQuote(value) {
+  return `"${String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function uniqueStrings(items) {
+  return [...new Set(items.filter(Boolean))];
+}
+
+function normalizeMemoryTag(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^#/, "")
+    .replace(/[^A-Za-z0-9/_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function inferMemoryTags({ text, schedule, kind, extraTags = [] }) {
+  const combined = String(text || "");
+  const lower = combined.toLowerCase();
+  const tickers = extractTickers(combined);
+  const scheduleMarkets = normalizeList(schedule?.markets, []);
+  const tags = [
+    `kind/${kind || "note"}`,
+    ...scheduleMarkets.map((market) => `market/${market}`),
+    ...tickers.map((ticker) => `asset/${ticker.replace("/", "")}`),
+    ...extraTags
+  ];
+
+  if (lower.includes("liquidation") || lower.includes("funding")) tags.push("signal/liquidity");
+  if (/\b(nvidia|nvda|ai|artificial intelligence)\b/.test(lower)) tags.push("theme/ai");
+  if (lower.includes("fed") || lower.includes("cpi") || lower.includes("yield") || lower.includes("dxy")) tags.push("theme/macro");
+  if (lower.includes("china") || lower.includes("tariff")) tags.push("theme/china");
+  if (lower.includes("short")) tags.push("bias/short");
+  if (lower.includes("long")) tags.push("bias/long");
+
+  return uniqueStrings(tags.map(normalizeMemoryTag).filter(Boolean)).slice(0, 40);
+}
+
+function buildMemoryMarkdown({ id, kind, subject, text, source, trigger, schedule, tags, assets, createdAt, stamp, deliveryChannels }) {
+  const body = String(text || "").replaceAll(telegramMessageSeparator, "\n\n---\n\n").trim();
+  const tagLines = tags.map((tag) => `  - ${tag}`).join("\n") || "  - kind/note";
+  const assetLines = assets.map((asset) => `  - ${asset}`).join("\n") || "  - none";
+  const channelLines = deliveryChannels.map((channel) => `  - ${channel}`).join("\n") || "  - none";
+
+  return [
+    "---",
+    `id: ${id}`,
+    `kind: ${kind}`,
+    `createdAt: ${createdAt}`,
+    `sgt: ${yamlQuote(stamp.label)}`,
+    `source: ${yamlQuote(source)}`,
+    `trigger: ${yamlQuote(trigger)}`,
+    `subject: ${yamlQuote(subject)}`,
+    `scheduleId: ${yamlQuote(schedule?.id || "")}`,
+    `scheduleEmail: ${yamlQuote(schedule?.email ? maskEmail(schedule.email) : "")}`,
+    "deliveryChannels:",
+    channelLines,
+    "tags:",
+    tagLines,
+    "assets:",
+    assetLines,
+    "---",
+    "",
+    `# ${subject}`,
+    "",
+    `- Time: ${stamp.label}`,
+    `- Kind: ${kind}`,
+    `- Source: ${source}`,
+    `- Trigger: ${trigger}`,
+    "",
+    "## Brief",
+    "",
+    body || "No text.",
+    "",
+    "## Review Notes",
+    "",
+    "- Outcome:",
+    "- What worked:",
+    "- What failed:",
+    "- Follow-up:"
+  ].join("\n");
+}
+
+async function saveMarketMemory({ kind = "note", subject, text, source = "marketos", trigger = "manual", schedule, deliveryChannels = [], extraTags = [] }) {
+  const cleanText = String(text || "").trim();
+  if (!cleanText) return null;
+
+  const stamp = getSgtStamp();
+  const createdAt = new Date().toISOString();
+  const id = randomUUID();
+  const assets = extractTickers(`${subject}\n${cleanText}`).slice(0, 20);
+  const tags = inferMemoryTags({ text: `${subject}\n${cleanText}`, schedule, kind, extraTags });
+  const fileName = `${stamp.isoDate}-${stamp.hhmm.replace(":", "")}-${slugifyFilePart(kind)}-${id.slice(0, 8)}.md`;
+  const filePath = join(memoryDir, fileName);
+  const relativePath = `data/market-memory/${fileName}`;
+  const markdown = buildMemoryMarkdown({
+    id,
+    kind,
+    subject,
+    text: cleanText,
+    source,
+    trigger,
+    schedule,
+    tags,
+    assets,
+    createdAt,
+    stamp,
+    deliveryChannels
+  });
+
+  await mkdir(memoryDir, { recursive: true });
+  await writeFile(filePath, `${markdown}\n`);
+
+  const entry = {
+    id,
+    kind,
+    subject,
+    source,
+    trigger,
+    tags,
+    assets,
+    path: relativePath,
+    createdAt,
+    sgt: stamp.label,
+    scheduleId: schedule?.id,
+    email: schedule?.email ? maskEmail(schedule.email) : undefined,
+    deliveryChannels,
+    textPreview: cleanText.replaceAll(telegramMessageSeparator, " ").replace(/\s+/g, " ").slice(0, 500)
+  };
+  const index = await readMemoryIndex();
+  index.unshift(entry);
+  await writeMemoryIndex(index);
+  return entry;
+}
+
+function searchMemoryEntries(entries, { query = "", tag = "", kind = "", limit = 25 } = {}) {
+  const q = String(query || "").trim().toLowerCase();
+  const tagNeedle = normalizeMemoryTag(tag).toLowerCase();
+  const kindNeedle = String(kind || "").trim().toLowerCase();
+
+  return entries
+    .filter((entry) => {
+      if (kindNeedle && String(entry.kind || "").toLowerCase() !== kindNeedle) return false;
+      if (tagNeedle && !(entry.tags || []).some((item) => String(item).toLowerCase() === tagNeedle)) return false;
+      if (!q) return true;
+      const haystack = [
+        entry.subject,
+        entry.source,
+        entry.trigger,
+        entry.textPreview,
+        ...(entry.tags || []),
+        ...(entry.assets || [])
+      ].join(" ").toLowerCase();
+      return haystack.includes(q);
+    })
+    .slice(0, Math.max(1, Math.min(100, Number(limit) || 25)));
+}
+
+async function attachMemoryMarkdown(entries) {
+  return Promise.all(
+    entries.map(async (entry) => {
+      try {
+        const markdown = await readFile(join(root, entry.path), "utf8");
+        return { ...entry, markdown };
+      } catch {
+        return { ...entry, markdown: null };
+      }
+    })
+  );
 }
 
 function isAdminRequest(request, url) {
@@ -475,6 +687,16 @@ async function sendDigestForSchedule(schedule, trigger = "scheduled") {
   }
 
   const digest = await generateDigest(schedule, trigger);
+  const memory = await saveMarketMemory({
+    kind: "scheduled-brief",
+    subject: digest.subject,
+    text: digest.text,
+    source: "scheduler",
+    trigger,
+    schedule,
+    deliveryChannels: schedule.deliveryChannels || [],
+    extraTags: ["delivery/scheduled"]
+  });
   const unsubscribeUrl = `${publicBaseUrl}/unsubscribe?token=${encodeURIComponent(schedule.unsubscribeToken)}`;
   const idempotencyKey = `${schedule.id}:${trigger}:${getSgtStamp().isoDate}:${getSgtStamp().hhmm}`;
   const footer = `\n\nUnsubscribe: ${unsubscribeUrl}`;
@@ -507,7 +729,7 @@ async function sendDigestForSchedule(schedule, trigger = "scheduled") {
     return { skipped: true, reason: "No delivery channels are enabled." };
   }
 
-  return { ok: true, subject: digest.subject, deliveries: deliveryResults };
+  return { ok: true, subject: digest.subject, deliveries: deliveryResults, memory };
 }
 
 function findSchedule(schedules, payload = {}) {
@@ -574,6 +796,18 @@ async function saveAndDeliverCodexBrief(payload) {
     deliveryResults,
     createdAt: new Date().toISOString()
   };
+  const memory = await saveMarketMemory({
+    kind: "codex-brief",
+    subject,
+    text,
+    source: record.source,
+    trigger: record.trigger,
+    schedule,
+    deliveryChannels: channels,
+    extraTags: ["delivery/codex"]
+  });
+  record.memoryId = memory?.id;
+  record.memoryPath = memory?.path;
   const briefs = await readCodexBriefs();
   briefs.unshift(record);
   await writeCodexBriefs(briefs);
@@ -828,11 +1062,23 @@ async function runResearchMonitorTick() {
       const alerts = result.memory?.alerts || [];
       if (!alerts.length) continue;
 
+      const flashText = `${formatFlashAlerts(alerts)}\n\nAnalysis only. No orders are placed.`;
+      await saveMarketMemory({
+        kind: "flash-alert",
+        subject: "MarketOS FLASH",
+        text: flashText,
+        source: "research-monitor",
+        trigger: "monitor-flash",
+        schedule,
+        deliveryChannels: schedule.deliveryChannels || [],
+        extraTags: ["alert/flash"]
+      });
+
       if (schedule.deliveryChannels?.includes("telegram")) {
         await sendTelegram({
           chatId: schedule.telegramChatId,
           subject: "MarketOS FLASH",
-          text: `${formatFlashAlerts(alerts)}\n\nAnalysis only. No orders are placed.`,
+          text: flashText,
           idempotencyKey: `${schedule.id}:monitor:${alerts.map((alert) => alert.sourceId).join(":")}`
         });
       }
@@ -916,6 +1162,7 @@ const server = createServer(async (request, response) => {
       const schedules = await readEmailSchedules();
       const logs = await readSentEmails();
       const research = await getResearchStatus(dataDir).catch(() => null);
+      const memory = await readMemoryIndex().catch(() => []);
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({
         schedulerEnabled,
@@ -938,6 +1185,8 @@ const server = createServer(async (request, response) => {
               pendingAlertCount: research.pendingAlerts.length
             }
           : null,
+        memoryCount: memory.length,
+        lastMemory: memory[0] || null,
         lastEmail: sanitizeEmailLog(logs.at(-1))
       }));
       return;
@@ -951,12 +1200,65 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/api/memory") {
+      requireAdmin(request, url);
+      const entries = await readMemoryIndex();
+      const filtered = searchMemoryEntries(entries, {
+        query: url.searchParams.get("q") || url.searchParams.get("query") || "",
+        tag: url.searchParams.get("tag") || "",
+        kind: url.searchParams.get("kind") || "",
+        limit: url.searchParams.get("limit") || 25
+      });
+      const includeText = url.searchParams.get("include_text") === "true";
+      const resultEntries = includeText ? await attachMemoryMarkdown(filtered) : filtered;
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ count: resultEntries.length, total: entries.length, entries: resultEntries }));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname.startsWith("/api/memory/")) {
+      requireAdmin(request, url);
+      const id = decodeURIComponent(url.pathname.slice("/api/memory/".length));
+      const entries = await readMemoryIndex();
+      const entry = entries.find((item) => item.id === id);
+      if (!entry) {
+        response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ error: "Memory note not found." }));
+        return;
+      }
+      const [entryWithText] = await attachMemoryMarkdown([entry]);
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ entry: entryWithText }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/memory") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const schedules = await readEmailSchedules();
+      const schedule = payload.scheduleId || payload.email ? findSchedule(schedules, payload) : undefined;
+      const entry = await saveMarketMemory({
+        kind: String(payload.kind || "manual-note"),
+        subject: String(payload.subject || "Manual MarketOS note").slice(0, 180),
+        text: String(payload.text || payload.markdown || ""),
+        source: String(payload.source || "manual"),
+        trigger: String(payload.trigger || "manual"),
+        schedule,
+        deliveryChannels: normalizeList(payload.deliveryChannels, []),
+        extraTags: normalizeList(payload.tags, ["manual"])
+      });
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, entry }));
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/api/codex/context") {
       requireAdmin(request, url);
-      const [schedules, research, briefs] = await Promise.all([
+      const [schedules, research, briefs, memory] = await Promise.all([
         readEmailSchedules(),
         getResearchStatus(dataDir),
-        readCodexBriefs()
+        readCodexBriefs(),
+        readMemoryIndex()
       ]);
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({
@@ -971,6 +1273,7 @@ const server = createServer(async (request, response) => {
         },
         schedules: schedules.map((schedule) => sanitizeSchedule(schedule)),
         research,
+        recentMemory: memory.slice(0, 12),
         recentCodexBriefs: briefs.slice(0, 12).map((brief) => sanitizeCodexBrief(brief))
       }));
       return;
