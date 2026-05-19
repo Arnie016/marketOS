@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
@@ -443,7 +444,7 @@ async function saveFolder(payload) {
   const folders = await readFolders();
   const name = String(payload.name || "Untitled folder").trim().slice(0, 80);
   const record = {
-    id: payload.id || crypto.randomUUID(),
+    id: payload.id || randomUUID(),
     name,
     tickers: Array.isArray(payload.tickers) ? payload.tickers.slice(0, 20) : extractTickers(name),
     notes: String(payload.notes || "").trim().slice(0, 500),
@@ -469,7 +470,7 @@ async function saveSubscriber(payload) {
   }
 
   const record = {
-    id: crypto.randomUUID(),
+    id: randomUUID(),
     email: normalizedEmail,
     location: String(payload.location || "Singapore").trim(),
     timezone: String(payload.timezone || "Asia/Singapore").trim(),
@@ -530,9 +531,9 @@ async function saveEmailSchedule(payload) {
   const existing = schedules.find((item) => item.email === normalizedEmail);
 
   const record = {
-    id: payload.id || existing?.id || crypto.randomUUID(),
+    id: payload.id || existing?.id || randomUUID(),
     email: normalizedEmail,
-    unsubscribeToken: existing?.unsubscribeToken || crypto.randomUUID(),
+    unsubscribeToken: existing?.unsubscribeToken || randomUUID(),
     timezone: "Asia/Singapore",
     cadence: String(payload.cadence || "twice-daily"),
     sendTimesSgt: sendTimesSgt.length ? sendTimesSgt : ["08:30", "21:00"],
