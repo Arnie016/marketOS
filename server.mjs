@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getResearchStatus, runResearchSnapshot } from "./research-engine.mjs";
+import { fetchYouTubeTranscript, getResearchStatus, runResearchSnapshot } from "./research-engine.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
@@ -16,6 +16,7 @@ const sentEmailsFile = join(root, "data", "sent-emails.json");
 const codexBriefsFile = join(root, "data", "codex-briefs.json");
 const memoryDir = join(root, "data", "market-memory");
 const memoryIndexFile = join(root, "data", "market-memory-index.json");
+const telegramOffsetFile = join(root, "data", "telegram-offset.json");
 const skillPath = process.env.FINANCIAL_ENGINE_SKILL_PATH || "/Users/arnav/.codex/skills/market-leverage-sentiment/SKILL.md";
 const builtInFinancialEnginePrompt = [
   "You are MarketOS, an analysis-only finance intelligence engine for a Singapore-based user.",
@@ -36,6 +37,8 @@ const sendEmailsEnabled = process.env.SEND_EMAILS === "true";
 const sendTelegramsEnabled = process.env.SEND_TELEGRAMS === "true";
 const researchPollEnabled = process.env.RESEARCH_POLL_ENABLED === "true";
 const researchPollIntervalMs = Math.max(15, Number(process.env.RESEARCH_POLL_INTERVAL_MINUTES || 180)) * 60_000;
+const telegramCommandsEnabled = process.env.TELEGRAM_COMMANDS_ENABLED === "true";
+const telegramPollIntervalMs = Math.max(5, Number(process.env.TELEGRAM_POLL_INTERVAL_SECONDS || 10)) * 1000;
 const telegramMessageSeparator = "---MSG---";
 const ignoredTickerWords = new Set([
   "AI",
@@ -116,6 +119,18 @@ async function readMemoryIndex() {
 async function writeMemoryIndex(entries) {
   await mkdir(dataDir, { recursive: true });
   await writeFile(memoryIndexFile, `${JSON.stringify(entries.slice(0, 1000), null, 2)}\n`);
+}
+
+async function readTelegramOffset() {
+  if (!existsSync(telegramOffsetFile)) return 0;
+  const raw = await readFile(telegramOffsetFile, "utf8");
+  const data = JSON.parse(raw || "{}");
+  return Number(data.offset || 0);
+}
+
+async function writeTelegramOffset(offset) {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(telegramOffsetFile, `${JSON.stringify({ offset, updatedAt: new Date().toISOString() }, null, 2)}\n`);
 }
 
 async function logEmailSend(record) {
@@ -383,6 +398,234 @@ async function attachMemoryMarkdown(entries) {
       }
     })
   );
+}
+
+function parseNumber(value) {
+  const cleaned = String(value ?? "").replace(/[$,%xX,]/g, "").trim();
+  if (!cleaned) return undefined;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseKeyValueText(text) {
+  const args = {};
+  const tokens = String(text || "").match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+
+  for (const token of tokens) {
+    const index = token.indexOf("=");
+    if (index <= 0) continue;
+    const key = token.slice(0, index).trim().toLowerCase();
+    const rawValue = token.slice(index + 1).trim().replace(/^["']|["']$/g, "");
+    args[key] = rawValue;
+  }
+
+  return args;
+}
+
+function calculateRisk(payload = {}) {
+  const args = parseKeyValueText(payload.text);
+  const side = String(payload.side || args.side || args.direction || "").toLowerCase();
+  const normalizedSide = side.startsWith("s") ? "short" : side.startsWith("l") ? "long" : "";
+  const asset = String(payload.asset || args.asset || args.symbol || "").toUpperCase() || "POSITION";
+  const entry = parseNumber(payload.entry ?? args.entry);
+  const current = parseNumber(payload.current ?? args.current ?? args.price);
+  const stop = parseNumber(payload.stop ?? payload.stopLoss ?? args.stop ?? args.sl);
+  const liquidation = parseNumber(payload.liquidation ?? payload.liq ?? args.liq ?? args.liquidation);
+  const leverage = parseNumber(payload.leverage ?? args.leverage ?? args.lev);
+  const margin = parseNumber(payload.margin ?? args.margin ?? args.size);
+
+  if (!entry || !normalizedSide) {
+    const error = new Error("Risk command needs at least side=long|short and entry=<price>.");
+    error.status = 400;
+    throw error;
+  }
+
+  const levelStats = (label, level) => {
+    if (!level) return null;
+    const spotMovePct = ((level - entry) / entry) * 100;
+    const roiPct = leverage ? (normalizedSide === "long" ? spotMovePct : -spotMovePct) * leverage : undefined;
+    const pnl = margin && roiPct !== undefined ? (margin * roiPct) / 100 : undefined;
+    return {
+      label,
+      level,
+      spotMovePct,
+      roiPct,
+      pnl
+    };
+  };
+
+  const stopStats = levelStats("stop", stop);
+  const liqStats = levelStats("liquidation", liquidation);
+  const currentStats = levelStats("current", current);
+  const adverseLiqDistancePct = liquidation
+    ? normalizedSide === "long"
+      ? ((entry - liquidation) / entry) * 100
+      : ((liquidation - entry) / entry) * 100
+    : undefined;
+  const stopDistancePct = stop ? Math.abs(((stop - entry) / entry) * 100) : undefined;
+  const stopToLiqRatio = stopDistancePct && adverseLiqDistancePct ? stopDistancePct / adverseLiqDistancePct : undefined;
+
+  let riskLabel = "unknown";
+  if (adverseLiqDistancePct !== undefined) {
+    if (adverseLiqDistancePct < 0.8) riskLabel = "extreme";
+    else if (adverseLiqDistancePct < 1.8) riskLabel = "high";
+    else if (adverseLiqDistancePct < 3.5) riskLabel = "medium";
+    else riskLabel = "lower";
+  }
+
+  return {
+    asset,
+    side: normalizedSide,
+    entry,
+    current,
+    stop,
+    liquidation,
+    leverage,
+    margin,
+    currentStats,
+    stopStats,
+    liqStats,
+    adverseLiqDistancePct,
+    stopDistancePct,
+    stopToLiqRatio,
+    riskLabel
+  };
+}
+
+function signedPct(value) {
+  if (value === undefined || value === null || Number.isNaN(value)) return "n/a";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function money(value) {
+  if (value === undefined || value === null || Number.isNaN(value)) return "n/a";
+  return `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
+}
+
+function formatRiskReport(risk) {
+  const stopInterpretation = risk.stopStats
+    ? risk.stopStats.roiPct > 0
+      ? "Stop level is favorable for this side; it behaves like profit-lock/TP, not loss protection."
+      : "Stop level is adverse for this side; it behaves like loss protection."
+    : null;
+  const lines = [
+    `${risk.asset} ${risk.side.toUpperCase()} RISK`,
+    "",
+    `Entry: ${risk.entry}`,
+    risk.current ? `Current: ${risk.current} | ROI now: ${signedPct(risk.currentStats?.roiPct)}${risk.currentStats?.pnl !== undefined ? ` (${money(risk.currentStats.pnl)})` : ""}` : null,
+    risk.stop ? `Stop: ${risk.stop} | spot move: ${signedPct(risk.stopStats.spotMovePct)} | leveraged ROI: ${signedPct(risk.stopStats.roiPct)}${risk.stopStats.pnl !== undefined ? ` (${money(risk.stopStats.pnl)})` : ""}` : "Stop: not provided",
+    risk.liquidation ? `Liq: ${risk.liquidation} | adverse room: ${signedPct(risk.adverseLiqDistancePct)} | risk: ${risk.riskLabel}` : "Liq: not provided",
+    risk.stopToLiqRatio ? `Stop uses ${(risk.stopToLiqRatio * 100).toFixed(0)}% of liquidation room.` : null,
+    stopInterpretation,
+    "",
+    "Read: keep this as analysis only. If stop/invalidation hits, thesis failed before liquidation should matter."
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function extractYouTubeVideoId(input) {
+  const text = String(input || "").trim();
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    if (url.hostname.includes("youtu.be")) return url.pathname.split("/").filter(Boolean)[0] || "";
+    if (url.hostname.includes("youtube.com")) {
+      if (url.searchParams.get("v")) return url.searchParams.get("v");
+      const parts = url.pathname.split("/").filter(Boolean);
+      const shortsIndex = parts.indexOf("shorts");
+      if (shortsIndex >= 0) return parts[shortsIndex + 1] || "";
+      const embedIndex = parts.indexOf("embed");
+      if (embedIndex >= 0) return parts[embedIndex + 1] || "";
+    }
+  } catch {
+    // Fall back to raw video ids.
+  }
+  return /^[A-Za-z0-9_-]{8,20}$/.test(text) ? text : "";
+}
+
+async function fetchYouTubeMetadata(videoId) {
+  if (process.env.YOUTUBE_API_KEY) {
+    const params = new URLSearchParams({
+      part: "snippet",
+      id: videoId,
+      key: process.env.YOUTUBE_API_KEY
+    });
+    const response = await fetch(`https://www.googleapis.com/youtube/v3/videos?${params}`);
+    const data = await response.json().catch(() => ({}));
+    const item = data.items?.[0];
+    if (response.ok && item) {
+      return {
+        title: item.snippet?.title,
+        channelTitle: item.snippet?.channelTitle,
+        publishedAt: item.snippet?.publishedAt,
+        description: item.snippet?.description
+      };
+    }
+  }
+
+  const url = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
+  const response = await fetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(url)}`);
+  const data = await response.json().catch(() => ({}));
+  return response.ok ? { title: data.title, channelTitle: data.author_name } : {};
+}
+
+async function analyzeYouTubeUrl({ url, prompt = "", schedule } = {}) {
+  const videoId = extractYouTubeVideoId(url);
+  if (!videoId) {
+    const error = new Error("Provide a valid YouTube URL or video id.");
+    error.status = 400;
+    throw error;
+  }
+
+  const [metadata, transcript] = await Promise.all([
+    fetchYouTubeMetadata(videoId).catch((error) => ({ error: error.message })),
+    fetchYouTubeTranscript(videoId, process.env)
+  ]);
+  const transcriptText = transcript.text || transcript.excerpt || "";
+  const analysis = await runChat({
+    model: process.env.DIGEST_MODEL || "gpt-5.5",
+    deepThink: true,
+    message: [
+      "Analyze this YouTube video for market thesis use.",
+      "Extract: claims, assets mentioned, catalysts, evidence quality, contradictions, and whether it changes any setup.",
+      "Return exactly 4 Telegram cards separated by ---MSG---: VIDEO, CLAIMS, MARKET IMPACT, WATCH.",
+      `URL: https://www.youtube.com/watch?v=${videoId}`,
+      `Title: ${metadata.title || "unknown"}`,
+      `Channel: ${metadata.channelTitle || "unknown"}`,
+      `Published: ${metadata.publishedAt || "unknown"}`,
+      `User prompt: ${prompt || "none"}`,
+      `Transcript status: ${transcript.status}; provider: ${transcript.provider || "unknown"}`,
+      `Transcript excerpt:\n${transcriptText.slice(0, 9000) || "No transcript text available."}`
+    ].join("\n\n"),
+    location: "Singapore",
+    timezone: "Asia/Singapore"
+  });
+
+  const subject = `YouTube thesis: ${metadata.title || videoId}`.slice(0, 180);
+  const memory = await saveMarketMemory({
+    kind: "youtube-analysis",
+    subject,
+    text: `${analysis.text}\n\nSource: https://www.youtube.com/watch?v=${videoId}`,
+    source: "youtube",
+    trigger: "youtube-analyze",
+    schedule,
+    deliveryChannels: ["telegram"],
+    extraTags: ["source/youtube"]
+  });
+
+  return {
+    videoId,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    metadata,
+    transcript: {
+      status: transcript.status,
+      provider: transcript.provider,
+      excerpt: transcriptText.slice(0, 1200),
+      error: transcript.error
+    },
+    analysis,
+    memory
+  };
 }
 
 function isAdminRequest(request, url) {
@@ -727,6 +970,168 @@ async function sendTelegram({ chatId, subject, text, idempotencyKey }) {
   return { ok: true, provider: "telegram", messageIds: sent, messageCount: sent.length };
 }
 
+function formatMemorySearch(entries, query) {
+  if (!entries.length) return `MEMORY\nNo notes found for "${query || "latest"}".`;
+  return [
+    `MEMORY ${query ? `| ${query}` : "| latest"}`,
+    "",
+    ...entries.slice(0, 5).map((entry, index) => {
+      const tags = (entry.tags || []).slice(0, 4).join(", ");
+      return `${index + 1}. ${entry.subject}\n${entry.sgt} | ${entry.kind}${tags ? ` | ${tags}` : ""}\n${entry.textPreview || ""}`;
+    })
+  ].join("\n\n").slice(0, 3500);
+}
+
+async function answerNowCommand({ chatId, query, schedule }) {
+  const entries = searchMemoryEntries(await readMemoryIndex(), { query, limit: 5 });
+  const research = await getResearchStatus(dataDir).catch(() => null);
+  const result = await runChat({
+    model: process.env.DIGEST_MODEL || "gpt-5.5",
+    deepThink: true,
+    message: [
+      `User asked Telegram /now ${query || ""}.`,
+      "Return exactly 4 Telegram cards separated by ---MSG---: NOW, THESIS, SETUPS, WATCH.",
+      "Use conditional setups only. No order placement. Mention if live market data/TradingView is unavailable.",
+      `Recent memory:\n${JSON.stringify(entries).slice(0, 6000)}`,
+      `Research status:\n${JSON.stringify(research).slice(0, 6000)}`
+    ].join("\n\n"),
+    folder: { name: "Telegram command", tickers: query ? [query] : schedule?.markets || [] },
+    bundle: query,
+    location: "Singapore",
+    timezone: "Asia/Singapore"
+  });
+
+  await sendTelegram({
+    chatId,
+    subject: `MarketOS NOW ${query || ""}`.trim(),
+    text: result.text,
+    idempotencyKey: `telegram-now:${chatId}:${Date.now()}`
+  });
+  return result;
+}
+
+async function handleTelegramCommand(update) {
+  const message = update.message || update.edited_message;
+  const text = String(message?.text || "").trim();
+  const chatId = message?.chat?.id;
+  if (!chatId || !text.startsWith("/")) return null;
+
+  const allowedChatId = String(process.env.TELEGRAM_DEFAULT_CHAT_ID || "").trim();
+  if (allowedChatId && String(chatId) !== allowedChatId) {
+    console.warn(`[telegram-commands] ignored command from unauthorized chat ${chatId}`);
+    return null;
+  }
+
+  const [rawCommand, ...restParts] = text.split(/\s+/);
+  const command = rawCommand.split("@")[0].toLowerCase();
+  const rest = restParts.join(" ").trim();
+  const schedules = await readEmailSchedules();
+  const schedule = schedules.find((item) => String(item.telegramChatId) === String(chatId)) || findSchedule(schedules, {});
+
+  if (command === "/help" || command === "/start") {
+    await sendTelegram({
+      chatId,
+      subject: "MarketOS commands",
+      text: [
+        "/now ETH - memory-aware thesis",
+        "/risk asset=ETH side=short entry=2099.7 liq=2139 stop=2097 leverage=18 margin=100",
+        "/memory ETH - search saved notes",
+        "/youtube <url> - transcript-aware video thesis",
+        "/alerts - pending alert memory",
+        "/status - bot/source status",
+        "",
+        "Analysis only. No orders are placed."
+      ].join("\n"),
+      idempotencyKey: `telegram-help:${chatId}:${Date.now()}`
+    });
+    return { ok: true, command };
+  }
+
+  if (command === "/status") {
+    const research = await getResearchStatus(dataDir).catch(() => null);
+    const memory = await readMemoryIndex().catch(() => []);
+    await sendTelegram({
+      chatId,
+      subject: "MarketOS status",
+      text: [
+        `Scheduler: ${schedulerEnabled ? "on" : "off"} | Research: ${researchPollEnabled ? "on" : "off"} | Commands: ${telegramCommandsEnabled ? "on" : "off"}`,
+        `Telegram: ${sendTelegramsEnabled ? "send-on" : "send-off"} | OpenAI: ${process.env.OPENAI_API_KEY ? "configured" : "missing"} | YouTube: ${process.env.YOUTUBE_API_KEY ? "configured" : "missing"}`,
+        `Memory notes: ${memory.length}`,
+        `Research runs: ${research?.runCount || 0} | Pending alerts: ${research?.pendingAlerts?.length || 0}`
+      ].join("\n"),
+      idempotencyKey: `telegram-status:${chatId}:${Date.now()}`
+    });
+    return { ok: true, command };
+  }
+
+  if (command === "/risk" || command === "/liq" || command === "/plan") {
+    const risk = calculateRisk({ text: rest });
+    await sendTelegram({
+      chatId,
+      subject: "MarketOS risk",
+      text: formatRiskReport(risk),
+      idempotencyKey: `telegram-risk:${chatId}:${Date.now()}`
+    });
+    await saveMarketMemory({
+      kind: "risk-check",
+      subject: `${risk.asset} ${risk.side} risk check`,
+      text: formatRiskReport(risk),
+      source: "telegram-command",
+      trigger: command,
+      schedule,
+      deliveryChannels: ["telegram"],
+      extraTags: ["risk/check"]
+    });
+    return { ok: true, command, risk };
+  }
+
+  if (command === "/memory") {
+    const entries = searchMemoryEntries(await readMemoryIndex(), { query: rest, limit: 5 });
+    await sendTelegram({
+      chatId,
+      subject: "MarketOS memory",
+      text: formatMemorySearch(entries, rest),
+      idempotencyKey: `telegram-memory:${chatId}:${Date.now()}`
+    });
+    return { ok: true, command, count: entries.length };
+  }
+
+  if (command === "/alerts") {
+    const entries = searchMemoryEntries(await readMemoryIndex(), { tag: "alert/flash", limit: 5 });
+    await sendTelegram({
+      chatId,
+      subject: "MarketOS alerts",
+      text: formatMemorySearch(entries, "alert/flash"),
+      idempotencyKey: `telegram-alerts:${chatId}:${Date.now()}`
+    });
+    return { ok: true, command, count: entries.length };
+  }
+
+  if (command === "/now" || command === "/thesis") {
+    return answerNowCommand({ chatId, query: rest.toUpperCase(), schedule });
+  }
+
+  if (command === "/youtube" || command === "/yt") {
+    const [url, ...promptParts] = restParts;
+    const result = await analyzeYouTubeUrl({ url, prompt: promptParts.join(" "), schedule });
+    await sendTelegram({
+      chatId,
+      subject: result.metadata.title ? `YouTube: ${result.metadata.title}`.slice(0, 180) : "YouTube thesis",
+      text: `${result.analysis.text}\n\nSource: ${result.url}`,
+      idempotencyKey: `telegram-youtube:${chatId}:${result.videoId}:${Date.now()}`
+    });
+    return { ok: true, command, videoId: result.videoId };
+  }
+
+  await sendTelegram({
+    chatId,
+    subject: "MarketOS command not recognized",
+    text: "Use /help for commands.",
+    idempotencyKey: `telegram-unknown:${chatId}:${Date.now()}`
+  });
+  return { ok: false, command, reason: "unknown" };
+}
+
 async function sendDigestForSchedule(schedule, trigger = "scheduled") {
   if (schedule.unsubscribedAt) {
     return { skipped: true, reason: "Schedule is unsubscribed." };
@@ -1037,6 +1442,7 @@ async function unsubscribeSchedule(token) {
 
 let schedulerRunning = false;
 let researchMonitorRunning = false;
+let telegramCommandsRunning = false;
 
 async function runSchedulerTick() {
   if (schedulerRunning) return;
@@ -1148,6 +1554,67 @@ function startResearchMonitor() {
   setInterval(() => runResearchMonitorTick().catch((error) => console.error(`[research] ${error.message}`)), researchPollIntervalMs);
 }
 
+async function runTelegramCommandsTick() {
+  if (telegramCommandsRunning) return;
+  telegramCommandsRunning = true;
+  try {
+    if (!process.env.TELEGRAM_BOT_TOKEN) return;
+    const offset = await readTelegramOffset();
+    const params = new URLSearchParams({
+      timeout: "0",
+      limit: "20"
+    });
+    if (offset) params.set("offset", String(offset));
+
+    const response = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/getUpdates?${params}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      console.error(`[telegram-commands] ${data.description || response.statusText}`);
+      return;
+    }
+
+    let nextOffset = offset;
+    for (const update of data.result || []) {
+      nextOffset = Math.max(nextOffset, Number(update.update_id || 0) + 1);
+      try {
+        await handleTelegramCommand(update);
+      } catch (error) {
+        const chatId = update.message?.chat?.id || update.edited_message?.chat?.id;
+        console.error(`[telegram-commands] ${error.message}`);
+        if (chatId) {
+          await sendTelegram({
+            chatId,
+            subject: "MarketOS command error",
+            text: `${error.message}\n\nUse /help for command syntax.`,
+            idempotencyKey: `telegram-command-error:${chatId}:${update.update_id || Date.now()}`
+          }).catch((sendError) => console.error(`[telegram-commands] failed to send error: ${sendError.message}`));
+        }
+      }
+    }
+
+    if (nextOffset !== offset) await writeTelegramOffset(nextOffset);
+  } catch (error) {
+    console.error(`[telegram-commands] ${error.message}`);
+  } finally {
+    telegramCommandsRunning = false;
+  }
+}
+
+function startTelegramCommands() {
+  if (!telegramCommandsEnabled) {
+    console.log("[telegram-commands] disabled by TELEGRAM_COMMANDS_ENABLED!=true");
+    return;
+  }
+  if (!process.env.TELEGRAM_BOT_TOKEN) {
+    console.log("[telegram-commands] disabled because TELEGRAM_BOT_TOKEN is missing");
+    return;
+  }
+
+  console.log(`[telegram-commands] enabled; interval=${Math.round(telegramPollIntervalMs / 1000)}s`);
+  setTimeout(() => runTelegramCommandsTick().catch((error) => console.error(`[telegram-commands] ${error.message}`)), 3_000);
+  setInterval(() => runTelegramCommandsTick().catch((error) => console.error(`[telegram-commands] ${error.message}`)), telegramPollIntervalMs);
+}
+
 async function serveStatic(pathname, response, headOnly = false) {
   const requested = pathname === "/" ? "/index.html" : pathname;
   const filePath = normalize(join(publicDir, requested));
@@ -1214,6 +1681,8 @@ const server = createServer(async (request, response) => {
         schedulerEnabled,
         sendEmailsEnabled,
         sendTelegramsEnabled,
+        telegramCommandsEnabled,
+        telegramPollIntervalSeconds: Math.round(telegramPollIntervalMs / 1000),
         researchPollEnabled,
         researchPollIntervalMinutes: Math.round(researchPollIntervalMs / 60_000),
         telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_DEFAULT_CHAT_ID),
@@ -1357,6 +1826,42 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/api/risk") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const risk = calculateRisk(payload);
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, risk, text: formatRiskReport(risk) }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/youtube/analyze") {
+      requireAdmin(request, url);
+      const payload = await readJsonBody(request);
+      const schedules = await readEmailSchedules();
+      const schedule = payload.scheduleId || payload.email ? findSchedule(schedules, payload) : findSchedule(schedules, {});
+      const result = await analyzeYouTubeUrl({ url: payload.url || payload.videoId, prompt: payload.prompt, schedule });
+      if (payload.sendTelegram !== false) {
+        await sendTelegram({
+          chatId: payload.telegramChatId || schedule?.telegramChatId,
+          subject: result.metadata.title ? `YouTube: ${result.metadata.title}`.slice(0, 180) : "YouTube thesis",
+          text: `${result.analysis.text}\n\nSource: ${result.url}`,
+          idempotencyKey: `youtube-analyze:${result.videoId}:${Date.now()}`
+        });
+      }
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true, result }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/telegram/commands/poll") {
+      requireAdmin(request, url);
+      await runTelegramCommandsTick();
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/api/research/run") {
       requireAdmin(request, url);
       const payload = await readJsonBody(request);
@@ -1472,4 +1977,5 @@ server.listen(port, () => {
   console.log(`ThesisOS running at http://localhost:${port}`);
   startScheduler();
   startResearchMonitor();
+  startTelegramCommands();
 });

@@ -139,7 +139,7 @@ async function fetchTranscriptFromProvider(videoId, env) {
   }
 }
 
-async function fetchYouTubeTranscript(videoId, env) {
+export async function fetchYouTubeTranscript(videoId, env) {
   if (env.YOUTUBE_TRANSCRIPTS_ENABLED === "false") {
     return { status: "disabled", note: "YOUTUBE_TRANSCRIPTS_ENABLED=false" };
   }
