@@ -701,29 +701,43 @@ function classifyTicker(ticker) {
   return "equity";
 }
 
-function fallbackAnalysis(payload, skillLoaded) {
+function fallbackAnalysis(payload, skillLoaded, options = {}) {
   const message = String(payload.message || "");
   const tickers = extractTickers(message);
   const assets = tickers.map((ticker) => ({ ticker, type: classifyTicker(ticker) }));
   const model = payload.model || "gpt-5.5";
   const focus = assets.length ? assets.map((asset) => asset.ticker).join(", ") : "the configured watchlist";
+  const reason = options.reason || "missing_openai_key";
+  const detail = options.error ? ` Detail: ${options.error}` : "";
+  const nowLines =
+    reason === "missing_openai_key"
+      ? [
+          "Local fallback is active: OPENAI_API_KEY is not visible to this server process.",
+          "No real model thesis was generated. Fix the runtime env before trusting scheduled briefs."
+        ]
+      : [
+          "OpenAI is configured, but this model call failed before a thesis was generated.",
+          `Reason: ${reason}.${detail}`,
+          "The scheduler did not invent a thesis; retry after fixing the API error or timeout."
+        ];
+  const watchLines =
+    reason === "missing_openai_key"
+      ? [
+          "Run /status in Telegram or GET /api/scheduler/status.",
+          "Confirm openaiConfigured=true and rerun the digest."
+        ]
+      : [
+          "Check PM2 logs for the OpenAI error.",
+          "If this was a timeout, increase OPENAI_TIMEOUT_MS / DIGEST_OPENAI_TIMEOUT_MS or use a faster digest model."
+        ];
   const text = [
-    [
-      "NOW",
-      "Local fallback is active: OPENAI_API_KEY is not visible to this PM2/server process.",
-      "No real model thesis was generated. Fix the runtime env before trusting scheduled briefs."
-    ].join("\n"),
+    ["NOW", ...nowLines].join("\n"),
     [
       "SETUPS",
       `No clean trigger returned for ${focus}.`,
-      "Use manual Codex/TradingView analysis until OpenAI is connected."
+      "Use manual Codex/TradingView analysis until the model call succeeds."
     ].join("\n"),
-    [
-      "WATCH",
-      "Run /status in Telegram or GET /api/scheduler/status.",
-      "Restart PM2 with OPENAI_API_KEY in the same command or use a persisted ecosystem/.env loader.",
-      "Analysis only. No orders are placed."
-    ].join("\n")
+    ["WATCH", ...watchLines, "Analysis only. No orders are placed."].join("\n")
   ].join(`\n\n${telegramMessageSeparator}\n\n`);
 
   return {
@@ -731,6 +745,8 @@ function fallbackAnalysis(payload, skillLoaded) {
     model,
     skillLoaded,
     tickers: assets,
+    error: options.error || undefined,
+    fallbackReason: reason,
     text
   };
 }
@@ -779,7 +795,8 @@ async function runChat(payload) {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(process.env.OPENAI_TIMEOUT_MS || 8_000));
+  const timeoutMs = Number(payload.timeoutMs || process.env.OPENAI_TIMEOUT_MS || 45_000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   let response;
   try {
@@ -813,13 +830,25 @@ async function runChat(payload) {
     });
   } catch (error) {
     clearTimeout(timeout);
-    return { ...fallbackAnalysis(payload, engine.loaded), provider: "local-fallback-after-api-error", error: error.message };
+    return {
+      ...fallbackAnalysis(payload, engine.loaded, {
+        reason: error.name === "AbortError" ? `openai_timeout_${timeoutMs}ms` : "openai_request_error",
+        error: error.message
+      }),
+      provider: "local-fallback-after-api-error"
+    };
   }
   clearTimeout(timeout);
 
   const data = await response.json();
   if (!response.ok) {
-    return { ...fallbackAnalysis(payload, engine.loaded), provider: "local-fallback-after-api-error", error: data.error?.message || response.statusText };
+    return {
+      ...fallbackAnalysis(payload, engine.loaded, {
+        reason: `openai_http_${response.status}`,
+        error: data.error?.message || response.statusText
+      }),
+      provider: "local-fallback-after-api-error"
+    };
   }
 
   return {
@@ -845,7 +874,7 @@ async function generateDigest(schedule, trigger = "scheduled") {
     "If live market/news/TradingView connectors are unavailable in this server process, say that clearly and produce a setup-ready brief rather than inventing current prices.",
     "Keep each Telegram message under 900 characters. No intro, no conclusion, no repeated headers. If there is no confirmed trade trigger, say 'No clean trigger' rather than forcing one.",
     "Include: top setup if any, safer leverage band, higher-risk version, exactly three primary probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and AI bottleneck chain when relevant.",
-    `Optional social/news source context:\n${JSON.stringify(sourceContext).slice(0, 12000)}`
+    `Optional social/news source context:\n${JSON.stringify(sourceContext).slice(0, 6000)}`
   ].join("\n\n");
 
   const result = await runChat({
@@ -855,11 +884,15 @@ async function generateDigest(schedule, trigger = "scheduled") {
     folder: { name: "Email autopilot", tickers: schedule.markets },
     bundle: schedule.markets.join(", "),
     location: "Singapore",
-    timezone: "Asia/Singapore"
+    timezone: "Asia/Singapore",
+    timeoutMs: Number(process.env.DIGEST_OPENAI_TIMEOUT_MS || process.env.OPENAI_TIMEOUT_MS || 60_000)
   });
 
   const body = result.text;
-  const sourceLine = result.provider === "openai" ? `Generated by ${result.model}.` : "Generated by local fallback until OPENAI_API_KEY is configured.";
+  const sourceLine =
+    result.provider === "openai"
+      ? `Generated by ${result.model}.`
+      : `Generated by local fallback (${result.fallbackReason || result.error || "unknown"}).`;
   const subject = `MarketOS ${trigger} brief - ${stamp.hhmm} SGT`;
 
   return {
