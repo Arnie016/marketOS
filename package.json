@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs"
+    "check": "node --check server.mjs",
+    "send:codex-brief": "node scripts/send-codex-brief.mjs"
   }
 }
