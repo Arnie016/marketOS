@@ -49,12 +49,13 @@ const builtInFinancialEnginePrompt = [
   "For leveraged setups, express risk as conditional bands, liquidation/wick tolerance, stop/invalidation logic, and scenario probabilities.",
   "Always separate public/news facts, technical data, source limitations, and inference.",
   "For Telegram, prefer terse message packs: NOW, BOTTLENECKS, SCENARIOS, SETUPS, WATCH.",
+  "Every setup must include TP, SL/invalidation, and exactly three execution variations: conservative, base, and aggressive. Each variation must include subjective probability/fit, trigger, TP, SL, leverage band, and when to skip it.",
   "For AI infrastructure themes, map the bottleneck chain: model demand -> compute/GPU capacity -> data centers -> power/grid -> cooling -> fiber/networking -> memory/storage -> capital/funding -> regulation/export controls.",
   "Track beneficiary baskets: hyperscalers, GPU/chip vendors, foundries/semicap, power/utilities, grid equipment, nuclear/gas, cooling, data-center REITs, Bitcoin miners/HPC pivots, and cloud/HPC operators.",
   "For miner/HPC names such as IREN, CORZ, RIOT, CLSK and related crypto infrastructure, distinguish BTC beta, power-contract value, AI/HPC hosting optionality, debt/dilution risk, and execution risk.",
   "When a catalyst is 'more AI data capacity' or similar, explain who benefits immediately, who benefits with lag, who gets squeezed by higher capex/power constraints, and what breaks the thesis.",
   "Use a probability rubric: three primary scenarios summing to 100%, plus optional tail paths/watch items without assigning fake precision.",
-  "SETUPS must be conditional: asset | bias | trigger | invalidation | safer leverage band | high-risk band.",
+  "SETUPS must be conditional: asset | variation | bias | trigger | TP | SL/invalidation | safer leverage band | high-risk band | probability/fit.",
   "If current market data or TradingView/MCP is unavailable in this server process, say so clearly and do not invent prices.",
   "Use the chain: development -> mechanism -> affected asset -> expected repricing/flow -> leverage implication.",
   "For scheduled briefs, include exactly three primary scenarios whose probabilities sum to 100%, then add tail paths only as unweighted watch items."
@@ -870,10 +871,10 @@ async function generateDigest(schedule, trigger = "scheduled") {
     `Delivery channel priority: Telegram first, email second. Alert style: ${schedule.alertStyle || "compact"}.`,
     isFlash
       ? `Return a Telegram message pack separated by exactly ${telegramMessageSeparator}. Message 1: FLASH - at most 3 one-line alerts under 160 chars each. Message 2: WATCH - at most 3 bullets. No essay.`
-      : `Return exactly 5 Telegram messages separated by exactly ${telegramMessageSeparator}. Message 1 title: NOW - one directional read and max 3 one-line alerts. Message 2 title: BOTTLENECKS - AI/crypto/macro constraints and beneficiary baskets, max 5 bullets. Message 3 title: SCENARIOS - exactly three primary probabilities summing to 100%, plus unweighted tail paths if needed. Message 4 title: SETUPS - max 3 conditional setups, each as ASSET | bias | trigger | invalidation | leverage band. Message 5 title: WATCH - next events/source status, max 5 bullets.`,
+      : `Return exactly 5 Telegram messages separated by exactly ${telegramMessageSeparator}. Message 1 title: NOW - one directional read and max 3 one-line alerts. Message 2 title: BOTTLENECKS - AI/crypto/macro constraints and beneficiary baskets, max 5 bullets. Message 3 title: SCENARIOS - exactly three primary probabilities summing to 100%, plus unweighted tail paths if needed. Message 4 title: SETUPS - exactly three execution variations for the strongest setup: Conservative, Base, Aggressive. Each line must include ASSET | bias | trigger | TP | SL/invalidation | leverage band | probability/fit | skip condition. Message 5 title: WATCH - next events/source status, max 5 bullets.`,
     "If live market/news/TradingView connectors are unavailable in this server process, say that clearly and produce a setup-ready brief rather than inventing current prices.",
     "Keep each Telegram message under 900 characters. No intro, no conclusion, no repeated headers. If there is no confirmed trade trigger, say 'No clean trigger' rather than forcing one.",
-    "Include: top setup if any, safer leverage band, higher-risk version, exactly three primary probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and AI bottleneck chain when relevant.",
+    "Include: top setup if any, exactly three execution variations (conservative/base/aggressive), safer leverage band, higher-risk version, exactly three primary probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and AI bottleneck chain when relevant.",
     `Optional social/news source context:\n${JSON.stringify(sourceContext).slice(0, 6000)}`
   ].join("\n\n");
 
@@ -1074,6 +1075,7 @@ async function answerNowCommand({ chatId, query, schedule }) {
       "Return exactly 5 Telegram cards separated by ---MSG---: NOW, BOTTLENECKS, SCENARIOS, SETUPS, WATCH.",
       "Use conditional setups only. No order placement. Mention if live market data/TradingView is unavailable.",
       "SCENARIOS must contain exactly three primary probabilities summing to 100%, plus unweighted tail paths if useful.",
+      "SETUPS must contain exactly three execution variations for the strongest setup: Conservative, Base, Aggressive. Each line includes asset, bias, trigger, TP, SL/invalidation, leverage band, probability/fit, and skip condition.",
       "BOTTLENECKS should map AI/crypto/macro infrastructure constraints when relevant: compute, power, data centers, miners/HPC, chips, countries/regulation.",
       `Recent memory:\n${JSON.stringify(entries).slice(0, 6000)}`,
       `Research status:\n${JSON.stringify(research).slice(0, 6000)}`
@@ -1429,7 +1431,7 @@ function buildDigestPrompt(record) {
     "Research engine: discover new public source events, extract captions/transcripts when available, store creator/source memory, and mark TradingView/MCP status honestly.",
     `Alert lanes: FLASH is one line under 220 characters; NOW is scan-first summary; BOTTLENECKS maps constraints; SCENARIOS has exactly three primary probabilities; SETUPS are conditional trade ideas only after triggers; WATCH is next events.`,
     `Output style: Telegram first, terse, no text walls. Separate Telegram cards with ${telegramMessageSeparator}. Use ${record.alertStyle || "compact"} mode. Include only the strongest setup lines.`,
-    `Output: top opportunities, exactly three primary probability scenarios summing to 100%, optional unweighted tail paths, leverage bands, safer vs high-risk version, TP/SL logic, invalidation, AI bottleneck implications, and source ledger.`,
+    `Output: top opportunities, exactly three primary probability scenarios summing to 100%, optional unweighted tail paths, leverage bands, three execution variations (conservative/base/aggressive) with probability/fit, TP, SL/invalidation, AI bottleneck implications, and source ledger.`,
     `Safety: analysis only; do not place orders or guarantee outcomes.`
   ].join(" ");
 }

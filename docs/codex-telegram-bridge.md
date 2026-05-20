@@ -46,7 +46,9 @@ One directional read. Say whether it is signal-ready or setup-only.
 ---MSG---
 
 SETUPS
-ASSET | bias | trigger | invalidation | safer leverage | high-risk cap
+Conservative: ASSET | bias | trigger | TP | SL/invalidation | leverage | probability/fit | skip if...
+Base: ASSET | bias | trigger | TP | SL/invalidation | leverage | probability/fit | skip if...
+Aggressive: ASSET | bias | trigger | TP | SL/invalidation | leverage | probability/fit | skip if...
 
 ---MSG---
 
@@ -69,7 +71,7 @@ Use TradingView MCP when available for OHLCV, levels, ATR/expected wick, opening
 
 Produce a Telegram-first brief with cards separated by ---MSG---:
 1. NOW: strongest current read and whether it is signal-ready or setup-only.
-2. SETUPS: max 3 conditional setups with asset, bias, trigger, invalidation, safer leverage band, high-risk cap.
+2. SETUPS: exactly three execution variations for the strongest setup: Conservative, Base, Aggressive. Each must include asset, bias, trigger, TP, SL/invalidation, leverage band, probability/fit, and skip condition.
 3. SCENARIOS: exactly three primary probabilities summing to 100%.
 4. WATCH: next events, timing windows in SGT, source limitations, and invalidations.
 
