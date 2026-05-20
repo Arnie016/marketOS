@@ -69,6 +69,7 @@ prompt_secret OPENAI_API_KEY "OpenAI API key"
 prompt_secret TELEGRAM_BOT_TOKEN "Telegram bot token"
 prompt_plain TELEGRAM_DEFAULT_CHAT_ID "Telegram chat id" "989856241"
 prompt_secret YOUTUBE_API_KEY "YouTube API key"
+prompt_secret X_BEARER_TOKEN "X API bearer token"
 prompt_secret EXA_API_KEY "Exa / EXASearch API key"
 
 set_value PORT "4177"
