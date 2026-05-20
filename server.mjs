@@ -1,12 +1,36 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fetchYouTubeTranscript, getResearchStatus, runResearchSnapshot } from "./research-engine.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
+
+function loadDotEnv(filePath) {
+  if (!existsSync(filePath)) return false;
+  const raw = readFileSync(filePath, "utf8");
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    let value = rawValue.trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined || process.env[key] === "") process.env[key] = value;
+  }
+  return true;
+}
+
+const envFileLoaded = loadDotEnv(join(root, ".env"));
+
 const publicDir = join(root, "public");
 const dataDir = join(root, "data");
 const dataFile = join(root, "data", "subscribers.json");
@@ -1713,6 +1737,9 @@ const server = createServer(async (request, response) => {
         telegramPollIntervalSeconds: Math.round(telegramPollIntervalMs / 1000),
         researchPollEnabled,
         researchPollIntervalMinutes: Math.round(researchPollIntervalMs / 60_000),
+        envFileLoaded,
+        adminConfigured: Boolean(process.env.ADMIN_TOKEN),
+        openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
         telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_DEFAULT_CHAT_ID),
         youtubeConfigured: Boolean(process.env.YOUTUBE_API_KEY),
         xConfigured: Boolean(process.env.X_BEARER_TOKEN),
