@@ -681,16 +681,33 @@ function fallbackAnalysis(payload, skillLoaded) {
   const message = String(payload.message || "");
   const tickers = extractTickers(message);
   const assets = tickers.map((ticker) => ({ ticker, type: classifyTicker(ticker) }));
-  const mode = payload.deepThink ? "Deep Think" : "Fast";
   const model = payload.model || "gpt-5.5";
-  const focus = assets.length ? assets.map((asset) => asset.ticker).join(", ") : "QQQ, SPY, NVDA, BTC";
+  const focus = assets.length ? assets.map((asset) => asset.ticker).join(", ") : "the configured watchlist";
+  const text = [
+    [
+      "NOW",
+      "Local fallback is active: OPENAI_API_KEY is not visible to this PM2/server process.",
+      "No real model thesis was generated. Fix the runtime env before trusting scheduled briefs."
+    ].join("\n"),
+    [
+      "SETUPS",
+      `No clean trigger returned for ${focus}.`,
+      "Use manual Codex/TradingView analysis until OpenAI is connected."
+    ].join("\n"),
+    [
+      "WATCH",
+      "Run /status in Telegram or GET /api/scheduler/status.",
+      "Restart PM2 with OPENAI_API_KEY in the same command or use a persisted ecosystem/.env loader.",
+      "Analysis only. No orders are placed."
+    ].join("\n")
+  ].join(`\n\n${telegramMessageSeparator}\n\n`);
 
   return {
     provider: "local-fallback",
     model,
     skillLoaded,
     tickers: assets,
-    text: `${mode} draft for ${focus}. Market timing comes first, then macro KPIs, catalyst chain, technical stack, scenario weights, leverage room, TP/SL, and delivery. Connect OPENAI_API_KEY to replace this local fallback with the selected model response.`
+    text
   };
 }
 
