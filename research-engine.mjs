@@ -389,6 +389,88 @@ async function fetchPerplexityContext(schedule, env) {
   };
 }
 
+function summarizeExaResult(result, query) {
+  const text =
+    result.text ||
+    result.summary ||
+    (Array.isArray(result.highlights) ? result.highlights.join(" ") : "");
+  const lower = `${result.title || ""} ${text || ""}`.toLowerCase();
+  const score = Math.min(
+    100,
+    25 +
+      highImpactTerms.filter((term) => lower.includes(term)).length * 6 +
+      (result.publishedDate && Date.now() - Date.parse(result.publishedDate) < 24 * 60 * 60 * 1000 ? 12 : 0)
+  );
+
+  return {
+    sourceType: "exa",
+    eventType: "web-result",
+    id: result.id || result.url,
+    sourceId: result.url ? `exa:${result.url}` : undefined,
+    title: result.title,
+    url: result.url,
+    author: result.author,
+    publishedAt: result.publishedDate,
+    query,
+    text: compactText(text, 1400),
+    score
+  };
+}
+
+async function fetchExaContext(schedule, env) {
+  if (!env.EXA_API_KEY) {
+    return { status: "not_configured", note: "Set EXA_API_KEY to add AI-native web/news discovery with extracted highlights." };
+  }
+
+  const defaultQueries = [
+    "latest market moving headlines Reuters AP Bloomberg CNBC WSJ Fed ECB DXY yields crypto equities",
+    "latest crypto liquidation funding ETF flows bitcoin ethereum solana CoinDesk The Block Coinglass",
+    "latest AI infrastructure Nvidia TSMC Broadcom power data center capex Reuters Bloomberg",
+    "latest macro geopolitics dollar oil gold yields China tariff Fed ECB"
+  ];
+  const queries = normalizeList(schedule.exaQueries, defaultQueries).slice(0, Number(env.EXA_QUERY_LIMIT || 4));
+  const results = [];
+
+  for (const query of queries) {
+    const response = await fetch("https://api.exa.ai/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": env.EXA_API_KEY
+      },
+      body: JSON.stringify({
+        query,
+        type: env.EXA_SEARCH_TYPE || "auto",
+        numResults: Number(env.EXA_MAX_RESULTS_PER_QUERY || 6),
+        startPublishedDate: getIsoHoursAgo(Number(env.EXA_LOOKBACK_HOURS || env.RESEARCH_LOOKBACK_HOURS || 36)),
+        contents: {
+          highlights: {
+            query: "market impact, affected assets, catalyst, contradiction, timing, source claim"
+          },
+          text: { maxCharacters: Number(env.EXA_TEXT_MAX_CHARS || 1200) }
+        }
+      })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return { status: "error", provider: "exa", error: data.error || data.message || response.statusText };
+    }
+    results.push({
+      query,
+      items: (data.results || []).map((result) => summarizeExaResult(result, query))
+    });
+  }
+
+  return {
+    status: "ok",
+    provider: "exa",
+    queries,
+    topItems: uniqueBy(results.flatMap((result) => result.items), (item) => item.sourceId)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 16)
+  };
+}
+
 function parseMarketSymbol(symbol) {
   const [exchange, ticker] = String(symbol || "").includes(":") ? String(symbol).split(":") : ["BINANCE", String(symbol || "")];
   return { exchange, symbol: ticker };
@@ -437,6 +519,7 @@ async function fetchMarketDataContext(schedule, env) {
 function normalizeEvents(context) {
   const youtubeEvents = context.youtube?.topItems || [];
   const xEvents = context.x?.topItems || [];
+  const exaEvents = context.exa?.topItems || [];
   const perplexityEvents = context.perplexity?.status === "ok"
     ? [{
         sourceType: "perplexity",
@@ -448,7 +531,7 @@ function normalizeEvents(context) {
         createdAt: new Date().toISOString()
       }]
     : [];
-  return [...youtubeEvents, ...xEvents, ...perplexityEvents].filter((event) => event.sourceId);
+  return [...youtubeEvents, ...xEvents, ...exaEvents, ...perplexityEvents].filter((event) => event.sourceId);
 }
 
 async function mergeSourceEvents(dataDir, events) {
@@ -540,6 +623,7 @@ function sourceStatuses(context) {
   return {
     youtube: context.youtube?.status || "unknown",
     x: context.x?.status || "unknown",
+    exa: context.exa?.status || "unknown",
     perplexity: context.perplexity?.status || "unknown",
     marketData: context.marketData?.status || "unknown"
   };
@@ -551,14 +635,15 @@ export async function runResearchSnapshot(schedule, options = {}) {
   await mkdir(dataDir, { recursive: true });
   const startedAt = new Date().toISOString();
 
-  const [youtube, x, perplexity, marketData] = await Promise.allSettled([
+  const [youtube, x, exa, perplexity, marketData] = await Promise.allSettled([
     fetchYouTubeContext(schedule, env),
     fetchXContext(schedule, env),
+    fetchExaContext(schedule, env),
     fetchPerplexityContext(schedule, env),
     fetchMarketDataContext(schedule, env)
   ]).then((results) => results.map((result) => (result.status === "fulfilled" ? result.value : { status: "error", error: result.reason?.message || "source failed" })));
 
-  const context = { youtube, x, perplexity, marketData };
+  const context = { youtube, x, exa, perplexity, marketData };
   const normalizedEvents = normalizeEvents(context);
   const { newEvents } = await mergeSourceEvents(dataDir, normalizedEvents);
   const creators = schedule.discoveryEnabled === false ? await readJsonFile(join(dataDir, "creators.json"), []) : await updateCreatorMemory(dataDir, youtube);

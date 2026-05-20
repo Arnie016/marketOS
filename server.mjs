@@ -48,6 +48,8 @@ const builtInFinancialEnginePrompt = [
   "Never place orders, enable trading, guarantee outcomes, or tell the user to go all-in.",
   "For leveraged setups, express risk as conditional bands, liquidation/wick tolerance, stop/invalidation logic, and scenario probabilities.",
   "Always separate public/news facts, technical data, source limitations, and inference.",
+  "Do a source-breadth check before recommending trades: market data, high-tier news, web search/Exa, X/social, YouTube/transcripts, funding/liquidations, and macro. Downgrade conviction when coverage is thin, stale, contradictory, or mostly social.",
+  "Treat Exa/web search as discovery and corroboration, not live price data. Treat X/YouTube/creator claims as weak unless confirmed by price action or higher-tier reporting.",
   "For Telegram, prefer terse message packs: NOW, BOTTLENECKS, SCENARIOS, SETUPS, WATCH.",
   "Every setup must include TP, SL/invalidation, and exactly three execution variations: conservative, base, and aggressive. Each variation must include subjective probability/fit, trigger, TP, SL, leverage band, and when to skip it.",
   "For AI infrastructure themes, map the bottleneck chain: model demand -> compute/GPU capacity -> data centers -> power/grid -> cooling -> fiber/networking -> memory/storage -> capital/funding -> regulation/export controls.",
@@ -873,9 +875,10 @@ async function generateDigest(schedule, trigger = "scheduled") {
       ? `Return a Telegram message pack separated by exactly ${telegramMessageSeparator}. Message 1: FLASH - at most 3 one-line alerts under 160 chars each. Message 2: WATCH - at most 3 bullets. No essay.`
       : `Return exactly 5 Telegram messages separated by exactly ${telegramMessageSeparator}. Message 1 title: NOW - one directional read and max 3 one-line alerts. Message 2 title: BOTTLENECKS - AI/crypto/macro constraints and beneficiary baskets, max 5 bullets. Message 3 title: SCENARIOS - exactly three primary probabilities summing to 100%, plus unweighted tail paths if needed. Message 4 title: SETUPS - exactly three execution variations for the strongest setup: Conservative, Base, Aggressive. Each line must include ASSET | bias | trigger | TP | SL/invalidation | leverage band | probability/fit | skip condition. Message 5 title: WATCH - next events/source status, max 5 bullets.`,
     "If live market/news/TradingView connectors are unavailable in this server process, say that clearly and produce a setup-ready brief rather than inventing current prices.",
+    "Before directional setups, state source quality in one line: STRONG if live market data + at least two independent high-tier developments align; MIXED if sources conflict; THIN if mostly social/YouTube/web discovery. Never force high conviction from THIN coverage.",
     "Keep each Telegram message under 900 characters. No intro, no conclusion, no repeated headers. If there is no confirmed trade trigger, say 'No clean trigger' rather than forcing one.",
     "Include: top setup if any, exactly three execution variations (conservative/base/aggressive), safer leverage band, higher-risk version, exactly three primary probability scenarios summing to 100%, TP/SL/invalidation logic, source modules checked, and AI bottleneck chain when relevant.",
-    `Optional social/news source context:\n${JSON.stringify(sourceContext).slice(0, 6000)}`
+    `Research/source context:\n${JSON.stringify(sourceContext).slice(0, 10000)}`
   ].join("\n\n");
 
   const result = await runChat({
@@ -1425,7 +1428,8 @@ function buildDigestPrompt(record) {
   return [
     `Run the market-leverage-sentiment engine for a Singapore-based user at ${times} SGT.`,
     `Markets: ${markets}.`,
-    `Sources: TradingView/OHLCV when available, macro calendar, CoinMarketCap-style market data, fear/greed/liquidity, funding/liquidations, source-tiered news, YouTube transcript/metadata extraction, X flow, Perplexity/web synthesis, and creator/social watchlist: ${creators}.`,
+    `Sources: TradingView/OHLCV when available, macro calendar, CoinMarketCap-style market data, fear/greed/liquidity, funding/liquidations, source-tiered news, Exa/EXASearch web discovery, YouTube transcript/metadata extraction, X flow, Perplexity/web synthesis, and creator/social watchlist: ${creators}.`,
+    "Source quality gate: do not give a high-conviction trade from one headline or one creator. Require independent corroboration, contradiction checks, and price/volume reaction. If source coverage is thin, say THIN and give only conditional setup-ready levels.",
     "AI bottleneck map: compute/GPU capacity, semiconductors/foundries, data centers, power/grid, cooling, memory/storage, networking/fiber, miner/HPC pivots, cloud capex, export controls, and country-level policy.",
     "Relevant baskets: NVDA/AVGO/TSM/ASML/AMD/MU, hyperscalers, data-center REITs, power/grid/nuclear/gas, cooling, IREN/CORZ/RIOT/CLSK-style miner/HPC infrastructure, BTC/ETH crypto beta, and index expressions like QQQ/SPY.",
     "Research engine: discover new public source events, extract captions/transcripts when available, store creator/source memory, and mark TradingView/MCP status honestly.",
@@ -1470,12 +1474,19 @@ async function saveEmailSchedule(payload) {
       "($ETH OR $BTC OR $SOL) (liquidity OR liquidation OR funding OR breakout) lang:en -is:retweet",
       "($QQQ OR $SPY OR $NVDA) (market OR earnings OR breakout OR macro) lang:en -is:retweet"
     ]).slice(0, 10),
+    exaQueries: normalizeList(payload.exaQueries, [
+      "latest market moving headlines Reuters AP Bloomberg CNBC WSJ Fed ECB DXY yields crypto equities",
+      "latest crypto liquidation funding ETF flows bitcoin ethereum solana CoinDesk The Block Coinglass",
+      "latest AI infrastructure Nvidia TSMC Broadcom power data center capex Reuters Bloomberg",
+      "latest macro geopolitics dollar oil gold yields China tariff Fed ECB"
+    ]).slice(0, 10),
     sourceModules: normalizeList(payload.sourceModules, [
       "tradingview",
       "news",
       "coin-market-data",
       "fear-greed",
       "funding-liquidations",
+      "exa-web-search",
       "youtube-social"
     ]).slice(0, 20),
     riskMode: String(payload.riskMode || "balanced").trim(),
@@ -1778,6 +1789,7 @@ const server = createServer(async (request, response) => {
         telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_DEFAULT_CHAT_ID),
         youtubeConfigured: Boolean(process.env.YOUTUBE_API_KEY),
         xConfigured: Boolean(process.env.X_BEARER_TOKEN),
+        exaConfigured: Boolean(process.env.EXA_API_KEY),
         perplexityConfigured: Boolean(process.env.PERPLEXITY_API_KEY),
         tradingViewHttpConfigured: Boolean(process.env.TRADINGVIEW_MCP_HTTP_URL || process.env.MARKET_DATA_HTTP_URL),
         publicBaseUrl,
@@ -1873,6 +1885,7 @@ const server = createServer(async (request, response) => {
           telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_DEFAULT_CHAT_ID),
           youtubeConfigured: Boolean(process.env.YOUTUBE_API_KEY),
           xConfigured: Boolean(process.env.X_BEARER_TOKEN),
+          exaConfigured: Boolean(process.env.EXA_API_KEY),
           perplexityConfigured: Boolean(process.env.PERPLEXITY_API_KEY),
           tradingViewHttpConfigured: Boolean(process.env.TRADINGVIEW_MCP_HTTP_URL || process.env.MARKET_DATA_HTTP_URL)
         },
