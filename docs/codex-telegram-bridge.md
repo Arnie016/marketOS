@@ -77,6 +77,15 @@ Produce a Telegram-first brief with cards separated by ---MSG---:
 
 Keep the Telegram cards terse. Save detailed tables and source ledger in the full brief/memory, but do not send a wall of text.
 
+Classify the strongest setup by risk-return quadrant before SETUPS:
+
+- `high-risk/high-return`: asymmetric thesis bet; use smaller size, hard invalidation, explicit leverage cap.
+- `low-risk/moderate-return`: cleaner parking or core trade; lower leverage stress.
+- `high-risk/low-return`: trap; skip unless reward:risk changes.
+- `no-edge/no-trade`: preserve capital and wait for trigger.
+
+Do not use static heuristics alone. Build the view from probability-weighted evidence, mechanism, price/flow reaction, reward:risk, wick room, and invalidation.
+
 After finalizing, send the brief to MarketOS:
 POST http://47.128.252.247:4177/api/codex-briefs
 Header: x-admin-token from MARKETOS_ADMIN_TOKEN
